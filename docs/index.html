@@ -296,7 +296,7 @@ footer a { color: var(--ink-soft); }
       <span class="badge">Apache-2.0</span>
       <span class="badge">python3 stdlib only</span>
       <span class="badge">no daemon · no broker</span>
-      <span class="badge">52 self-tests</span>
+      <span class="badge">59 self-tests</span>
       <span class="badge">linux · x11 optional</span>
     </div>
   </div>
@@ -322,7 +322,7 @@ footer a { color: var(--ink-soft); }
       <div>
         <div class="k">On this laptop</div>
         <div class="n">9</div>
-        <div class="d">workers, because 10.2&nbsp;GB free ÷ 900&nbsp;MB each is what fits</div>
+        <div class="d">workers — 10.2&nbsp;GB free ÷ the <em>measured</em> cost of a real worker</div>
       </div>
       <div>
         <div class="k">On a tired machine</div>
@@ -351,12 +351,13 @@ footer a { color: var(--ink-soft); }
         <span>claim → work → report → repeat</span>
       </div>
       <div class="diagram-scroll">
-        <svg viewBox="0 0 980 560" role="img" aria-labelledby="flowtitle flowdesc">
+        <svg viewBox="0 0 990 640" role="img" aria-labelledby="flowtitle flowdesc">
           <title id="flowtitle">How agent-fleet turns a task list into finished work</title>
           <desc id="flowdesc">Input sources feed a queue. A planner combines the queue with a machine
-            probe of cores, load and free memory, takes the smallest of four ceilings, and dispatches that
-            many workers across three lanes. Each worker claims, works, and reports done, blocked or
-            failed, then claims again. Blocked tasks return to the queue after a human clears them.</desc>
+            probe of cores, load, free memory and measured worker cost, takes the smallest of four
+            ceilings, and dispatches that many workers across three lanes. Each worker claims, works,
+            and reports done, blocked or failed, then claims again. Blocked tasks return to the queue
+            after a human clears them.</desc>
 
           <defs>
             <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -368,111 +369,114 @@ footer a { color: var(--ink-soft); }
             <marker id="ar-coral" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
               <path d="M0,0 L10,5 L0,10 z" fill="var(--coral)"/>
             </marker>
+            <marker id="ar-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--teal)"/>
+            </marker>
           </defs>
 
           <g font-family="ui-monospace, SF Mono, Menlo, monospace" font-size="12">
 
-            <!-- inputs -->
-            <text x="20" y="26" fill="var(--ink-faint)" font-size="10.5" letter-spacing="1.6">INPUT</text>
-            <rect x="20" y="38" width="168" height="40" rx="6" fill="var(--diagram-fill)" stroke="var(--line)"/>
-            <text x="34" y="63" fill="var(--ink)">fleet add · add-batch</text>
-            <rect x="20" y="88" width="168" height="40" rx="6" fill="var(--diagram-fill)" stroke="var(--line)"/>
-            <text x="34" y="113" fill="var(--ink)">fleet from-note</text>
-            <text x="34" y="146" fill="var(--ink-faint)" font-size="10.5">TASKS.md · URLs · text</text>
+            <!-- column 1 · input -->
+            <text x="24" y="30" fill="var(--ink-faint)" font-size="10.5" letter-spacing="1.6">INPUT</text>
+            <rect x="24" y="42" width="196" height="40" rx="6" fill="var(--diagram-fill)" stroke="var(--line)"/>
+            <text x="38" y="67" fill="var(--ink)">fleet add</text>
+            <rect x="24" y="94" width="196" height="40" rx="6" fill="var(--diagram-fill)" stroke="var(--line)"/>
+            <text x="38" y="119" fill="var(--ink)">fleet from-note</text>
+            <text x="38" y="152" fill="var(--ink-faint)" font-size="10.5">URLs · TASKS.md · plain text</text>
 
-            <!-- queue -->
-            <rect x="248" y="38" width="196" height="120" rx="8" fill="var(--diagram-fill)" stroke="var(--amber)" stroke-width="1.5"/>
-            <text x="264" y="60" fill="var(--amber)" font-size="10.5" letter-spacing="1.6">QUEUE · .agents/queue</text>
-            <text x="264" y="84" fill="var(--ink)">inbox/</text>
-            <text x="264" y="104" fill="var(--ink-soft)">active/</text>
-            <text x="264" y="124" fill="var(--ink-soft)">done/ blocked/ failed/</text>
-            <text x="264" y="146" fill="var(--ink-faint)" font-size="10.5">one JSON file per task</text>
+            <!-- column 2 · queue + probe -->
+            <rect x="272" y="42" width="200" height="120" rx="8" fill="var(--diagram-fill)" stroke="var(--amber)" stroke-width="1.5"/>
+            <text x="288" y="64" fill="var(--amber)" font-size="10.5" letter-spacing="1.6">QUEUE · .agents/queue</text>
+            <text x="288" y="88" fill="var(--ink)">inbox/</text>
+            <text x="288" y="108" fill="var(--ink-soft)">active/</text>
+            <text x="288" y="128" fill="var(--ink-soft)">done/ blocked/ failed/</text>
+            <text x="288" y="150" fill="var(--ink-faint)" font-size="10.5">one JSON file per task</text>
 
-            <!-- machine probe -->
-            <rect x="248" y="196" width="196" height="112" rx="8" fill="var(--diagram-fill)" stroke="var(--teal)" stroke-width="1.5"/>
-            <text x="264" y="218" fill="var(--teal)" font-size="10.5" letter-spacing="1.6">MACHINE PROBE</text>
-            <text x="264" y="242" fill="var(--ink)">cores · load1</text>
-            <text x="264" y="262" fill="var(--ink)">MemAvailable</text>
-            <text x="264" y="282" fill="var(--ink)">cgroup limit</text>
-            <text x="264" y="300" fill="var(--ink-faint)" font-size="10.5">read fresh every plan</text>
+            <rect x="272" y="200" width="200" height="132" rx="8" fill="var(--diagram-fill)" stroke="var(--teal)" stroke-width="1.5"/>
+            <text x="288" y="222" fill="var(--teal)" font-size="10.5" letter-spacing="1.6">MACHINE PROBE</text>
+            <text x="288" y="246" fill="var(--ink)">cores · load1</text>
+            <text x="288" y="266" fill="var(--ink)">MemAvailable · cgroup</text>
+            <text x="288" y="286" fill="var(--ink)">measured worker RSS</text>
+            <text x="288" y="308" fill="var(--ink-faint)" font-size="10.5">nothing assumed about</text>
+            <text x="288" y="322" fill="var(--ink-faint)" font-size="10.5">your hardware</text>
 
-            <!-- planner -->
-            <rect x="506" y="86" width="212" height="176" rx="8" fill="var(--diagram-fill)" stroke="var(--ink-faint)" stroke-width="1.5"/>
-            <text x="522" y="108" fill="var(--ink-faint)" font-size="10.5" letter-spacing="1.6">PLANNER · fleet plan</text>
-            <text x="522" y="134" fill="var(--ink-soft)">min(</text>
-            <text x="536" y="154" fill="var(--ink)">browser tasks,</text>
-            <text x="536" y="174" fill="var(--ink)">max_workers,</text>
-            <text x="536" y="194" fill="var(--ink)">distinct hosts,</text>
-            <text x="536" y="214" fill="var(--amber)">machine capacity</text>
-            <text x="522" y="234" fill="var(--ink-soft)">)</text>
-            <text x="522" y="254" fill="var(--ink-faint)" font-size="10.5">tightest ceiling wins</text>
+            <!-- column 3 · planner -->
+            <rect x="524" y="90" width="212" height="180" rx="8" fill="var(--diagram-fill)" stroke="var(--ink-faint)" stroke-width="1.5"/>
+            <text x="540" y="112" fill="var(--ink-faint)" font-size="10.5" letter-spacing="1.6">PLANNER · fleet plan</text>
+            <text x="540" y="138" fill="var(--ink-soft)">min(</text>
+            <text x="554" y="158" fill="var(--ink)">browser tasks,</text>
+            <text x="554" y="178" fill="var(--ink)">max_workers,</text>
+            <text x="554" y="198" fill="var(--ink)">distinct hosts,</text>
+            <text x="554" y="218" fill="var(--amber)">machine capacity</text>
+            <text x="540" y="238" fill="var(--ink-soft)">)</text>
+            <text x="540" y="260" fill="var(--ink-faint)" font-size="10.5">the tightest ceiling wins</text>
 
-            <!-- lanes -->
-            <text x="780" y="26" fill="var(--ink-faint)" font-size="10.5" letter-spacing="1.6">LANES</text>
-            <rect x="780" y="38" width="180" height="76" rx="6" fill="var(--diagram-fill)" stroke="var(--amber)"/>
-            <text x="794" y="60" fill="var(--amber)">browser</text>
-            <text x="794" y="80" fill="var(--ink-soft)" font-size="11">own tab + own session</text>
-            <text x="794" y="100" fill="var(--ink-faint)" font-size="11">costs a terminal</text>
+            <!-- column 4 · lanes -->
+            <text x="790" y="30" fill="var(--ink-faint)" font-size="10.5" letter-spacing="1.6">LANES</text>
+            <rect x="790" y="42" width="176" height="72" rx="6" fill="var(--diagram-fill)" stroke="var(--amber)"/>
+            <text x="804" y="64" fill="var(--amber)">browser</text>
+            <text x="804" y="84" fill="var(--ink-soft)" font-size="11">own tab + own session</text>
+            <text x="804" y="102" fill="var(--ink-faint)" font-size="11">costs a terminal</text>
 
-            <rect x="780" y="126" width="180" height="76" rx="6" fill="var(--diagram-fill)" stroke="var(--teal)"/>
-            <text x="794" y="148" fill="var(--teal)">agent</text>
-            <text x="794" y="168" fill="var(--ink-soft)" font-size="11">in-session subagent</text>
-            <text x="794" y="188" fill="var(--ink-faint)" font-size="11">no terminal</text>
+            <rect x="790" y="126" width="176" height="72" rx="6" fill="var(--diagram-fill)" stroke="var(--teal)"/>
+            <text x="804" y="148" fill="var(--teal)">agent</text>
+            <text x="804" y="168" fill="var(--ink-soft)" font-size="11">in-session subagent</text>
+            <text x="804" y="186" fill="var(--ink-faint)" font-size="11">no terminal</text>
 
-            <rect x="780" y="214" width="180" height="76" rx="6" fill="var(--diagram-fill)" stroke="var(--line)"/>
-            <text x="794" y="236" fill="var(--ink)">serial</text>
-            <text x="794" y="256" fill="var(--ink-soft)" font-size="11">one at a time</text>
-            <text x="794" y="276" fill="var(--ink-faint)" font-size="11">no terminal</text>
+            <rect x="790" y="210" width="176" height="72" rx="6" fill="var(--diagram-fill)" stroke="var(--line)"/>
+            <text x="804" y="232" fill="var(--ink)">serial</text>
+            <text x="804" y="252" fill="var(--ink-soft)" font-size="11">one at a time</text>
+            <text x="804" y="270" fill="var(--ink-faint)" font-size="11">no terminal</text>
 
             <!-- worker loop -->
-            <rect x="248" y="356" width="470" height="170" rx="8" fill="var(--diagram-fill)" stroke="var(--line)"/>
-            <text x="266" y="380" fill="var(--ink-faint)" font-size="10.5" letter-spacing="1.6">EACH WORKER, UNTIL THE LANE IS EMPTY</text>
+            <rect x="272" y="376" width="464" height="168" rx="8" fill="var(--diagram-fill)" stroke="var(--line)"/>
+            <text x="290" y="400" fill="var(--ink-faint)" font-size="10.5" letter-spacing="1.6">EACH WORKER, UNTIL THE LANE IS EMPTY</text>
 
-            <rect x="266" y="396" width="122" height="38" rx="5" fill="var(--surface-sunk)" stroke="var(--amber)"/>
-            <text x="280" y="420" fill="var(--amber)">claim</text>
-            <rect x="416" y="396" width="122" height="38" rx="5" fill="var(--surface-sunk)" stroke="var(--line)"/>
-            <text x="430" y="420" fill="var(--ink)">do the task</text>
-            <rect x="566" y="396" width="132" height="38" rx="5" fill="var(--surface-sunk)" stroke="var(--line)"/>
-            <text x="580" y="420" fill="var(--ink)">report once</text>
+            <rect x="290" y="416" width="118" height="38" rx="5" fill="var(--surface-sunk)" stroke="var(--amber)"/>
+            <text x="306" y="440" fill="var(--amber)">claim</text>
+            <rect x="432" y="416" width="132" height="38" rx="5" fill="var(--surface-sunk)" stroke="var(--line)"/>
+            <text x="448" y="440" fill="var(--ink)">do the task</text>
+            <rect x="588" y="416" width="130" height="38" rx="5" fill="var(--surface-sunk)" stroke="var(--line)"/>
+            <text x="604" y="440" fill="var(--ink)">report once</text>
 
-            <path d="M388,415 H414" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
-            <path d="M538,415 H564" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
-            <path d="M632,434 V462 H327 V436" stroke="var(--amber)" fill="none" stroke-dasharray="4 4" marker-end="url(#ar-amber)"/>
-            <text x="440" y="478" fill="var(--amber)" font-size="10.5">claim the next one — the pool never grows</text>
-
-            <text x="266" y="508" fill="var(--ink-soft)" font-size="11">
-              done = evidence observed · blocked = a human is needed · failed = give up
-            </text>
+            <path d="M408,435 H430" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
+            <path d="M564,435 H586" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
+            <path d="M653,454 V478 H349 V456" stroke="var(--amber)" fill="none" stroke-dasharray="4 4" marker-end="url(#ar-amber)"/>
+            <text x="404" y="498" fill="var(--amber)" font-size="10.5">claim the next one — the pool never grows</text>
+            <text x="290" y="526" fill="var(--ink-soft)" font-size="11">done = evidence observed · blocked = a human is needed</text>
 
             <!-- outcomes -->
-            <rect x="780" y="356" width="180" height="52" rx="6" fill="var(--diagram-fill)" stroke="var(--teal)"/>
-            <text x="794" y="380" fill="var(--teal)">done</text>
-            <text x="794" y="398" fill="var(--ink-faint)" font-size="11">+ confirmation seen</text>
+            <rect x="790" y="376" width="176" height="50" rx="6" fill="var(--diagram-fill)" stroke="var(--teal)"/>
+            <text x="804" y="399" fill="var(--teal)">done</text>
+            <text x="804" y="416" fill="var(--ink-faint)" font-size="11">+ confirmation seen</text>
 
-            <rect x="780" y="420" width="180" height="60" rx="6" fill="var(--diagram-fill)" stroke="var(--coral)"/>
-            <text x="794" y="444" fill="var(--coral)">blocked</text>
-            <text x="794" y="462" fill="var(--ink-faint)" font-size="11">login · captcha · 2FA</text>
+            <rect x="790" y="438" width="176" height="56" rx="6" fill="var(--diagram-fill)" stroke="var(--coral)"/>
+            <text x="804" y="461" fill="var(--coral)">blocked</text>
+            <text x="804" y="480" fill="var(--ink-faint)" font-size="11">login · captcha · 2FA</text>
 
-            <rect x="780" y="492" width="180" height="34" rx="6" fill="var(--diagram-fill)" stroke="var(--line)"/>
-            <text x="794" y="514" fill="var(--ink-soft)">failed</text>
+            <rect x="790" y="506" width="176" height="38" rx="6" fill="var(--diagram-fill)" stroke="var(--line)"/>
+            <text x="804" y="530" fill="var(--ink-soft)">failed</text>
 
             <!-- wiring -->
-            <path d="M188,58 H246" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
-            <path d="M188,108 H246" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
-            <path d="M444,98 H504" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
-            <path d="M444,250 H476 V180 H504" stroke="var(--teal)" fill="none" marker-end="url(#ar)"/>
-            <path d="M718,120 H778" stroke="var(--amber)" fill="none" marker-end="url(#ar-amber)"/>
-            <path d="M718,164 H778" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
-            <path d="M718,210 H752 V252 H778" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
-            <path d="M612,262 V354" stroke="var(--amber)" fill="none" marker-end="url(#ar-amber)"/>
-            <path d="M698,415 H778 V400" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
-            <path d="M698,425 H760 V440 H778" stroke="var(--coral)" fill="none" marker-end="url(#ar-coral)"/>
+            <path d="M220,62 H270" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
+            <path d="M220,114 H270" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
+            <path d="M472,102 H522" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
+            <path d="M472,266 H498 V196 H522" stroke="var(--teal)" fill="none" marker-end="url(#ar-teal)"/>
+            <path d="M736,124 H788" stroke="var(--amber)" fill="none" marker-end="url(#ar-amber)"/>
+            <path d="M736,162 H762 V162 H788" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
+            <path d="M736,200 H762 V246 H788" stroke="var(--ink-faint)" fill="none" marker-end="url(#ar)"/>
+            <path d="M630,270 V374" stroke="var(--amber)" fill="none" marker-end="url(#ar-amber)"/>
+            <path d="M718,428 H756 V400 H788" stroke="var(--teal)" fill="none" marker-end="url(#ar-teal)"/>
+            <path d="M718,443 H756 V466 H788" stroke="var(--coral)" fill="none" marker-end="url(#ar-coral)"/>
 
-            <!-- human loop -->
-            <path d="M870,480 V532 H210 V160" stroke="var(--coral)" fill="none" stroke-dasharray="5 5" marker-end="url(#ar-coral)"/>
-            <text x="470" y="548" fill="var(--coral)" font-size="10.5">
+            <!-- the human loop, routed clear of every box -->
+            <path d="M878,494 V596 H150 V104 H270"
+                  stroke="var(--coral)" fill="none" stroke-dasharray="5 5" marker-end="url(#ar-coral)"/>
+            <text x="330" y="588" fill="var(--coral)" font-size="10.5">
               you clear the logins in batches → fleet unblock --all → back to the queue
             </text>
+            <text x="24" y="352" fill="var(--coral)" font-size="10.5" transform="rotate(-90 24 352)"
+                  text-anchor="middle">human, in batches</text>
           </g>
         </svg>
       </div>
@@ -604,7 +608,7 @@ terminals needed: <span class="p">4</span>
 <pre><span class="c"># python3 stdlib only — nothing to pip install</span>
 git clone https://github.com/MSKazemi/agent-fleet ~/agent-fleet
 ~/agent-fleet/bin/install
-~/agent-fleet/bin/selftest        <span class="c"># 52 checks, no browser needed</span>
+~/agent-fleet/bin/selftest        <span class="c"># 59 checks, no browser needed</span>
 
 cd ~/any/project
 fleet <span class="p">init</span>
