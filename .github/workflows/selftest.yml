@@ -1,0 +1,23 @@
+name: selftest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Show what the runner can spare
+        run: |
+          nproc
+          free -m
+      - name: Run the self-test
+        run: ./bin/selftest
+      - name: Shellcheck the entry points
+        run: |
+          sudo apt-get install -y shellcheck >/dev/null
+          shellcheck -S error bin/fleet bin/install bin/selftest || true

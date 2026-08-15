@@ -1,6 +1,18 @@
 # agent-fleet
 
-**Run many Claude Code sessions in parallel against one shared task queue.**
+[![selftest](https://github.com/MSKazemi/agent-fleet/actions/workflows/selftest.yml/badge.svg)](https://github.com/MSKazemi/agent-fleet/actions/workflows/selftest.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python3 stdlib only](https://img.shields.io/badge/deps-none-informational)](libexec/fleet-queue)
+[![docs](https://img.shields.io/badge/docs-mskazemi.github.io%2Fagent--fleet-E0912F)](https://mskazemi.github.io/agent-fleet/)
+
+**Run many Claude Code sessions in parallel against one shared task queue — as many as the
+work and your machine can actually take, and no more.**
+
+> 100 tasks does not mean 100 browser tabs. Concurrency is the smallest of four ceilings,
+> re-checked on every run: the work, your cap, one worker per host, and what this computer
+> can spare right now.
+
+📊 **[Architecture and capacity model, illustrated →](https://mskazemi.github.io/agent-fleet/)**
 
 Give it a list of work — URLs to process, forms to fill, repos to migrate,
 questions to research — and it decides how much parallelism the list actually
@@ -38,8 +50,8 @@ those share a host.
 ## Why
 
 Running N agents in parallel is easy. Running them *well* is not: they duplicate
-each other's work, hammer one host until it rate-limits, open terminals nobody
-needed, silently claim success, and stall the moment a login page appears.
+each other's work, hammer one host until it rate-limits, open more browsers than the
+machine can hold, silently claim success, and stall the moment a login page appears.
 agent-fleet is the small amount of machinery that fixes exactly those five things.
 
 - **No duplicated work** — claiming a task is a single atomic `rename(2)`. Eight
@@ -47,6 +59,9 @@ agent-fleet is the small amount of machinery that fixes exactly those five thing
   no broker, no daemon.
 - **No pointless terminals** — work that needs no browser runs as a subagent
   inside your current session.
+- **No thrashed machine** — the planner reads cores, load average, `MemAvailable` and any
+  cgroup limit, and never plans past what fits. On a tired laptop it degrades to one worker
+  and says so; it does not refuse the run, and it does not swap you to a halt.
 - **No rate-limit bans** — at most one worker per host.
 - **No silent success** — a task is `done` only with the confirmation the system
   actually returned.
@@ -131,8 +146,38 @@ The lane is inferred when you add the task — a live URL means `browser`, plain
 text means `agent` — and `--exec` / `--serial` override it.
 
 ```
-terminals = min(browser tasks, max_workers, distinct hosts)
+workers = min(
+  browser_tasks,      # never more workers than there is work
+  max_workers,        # your configured preference
+  distinct_hosts,     # one worker per site, so nothing gets hammered
+  machine_capacity,   # what this computer can actually take
+)
+
+machine_capacity = min(
+  cores × max_load_per_core − load1   (capped at cores − reserve_cores),
+  (MemAvailable − reserve_mem_mb) ÷ mem_per_browser_worker_mb,
+)
 ```
+
+Memory comes from `/proc/meminfo` rather than a guess, and a container's `memory.max` is
+honoured when present. If nothing fits, capacity floors at **one worker** with a plain
+message instead of thrashing:
+
+```console
+$ fleet plan
+machine: 20 cores, load 3.29, 2.1 GB free
+         → room for 1 browser worker(s) and 6 subagent(s), bound by memory
+
+pending: 100 task(s)
+terminals needed: 1
+  one at a time — this machine has no room for more right now
+  the other 99 browser task(s) wait in the queue — each worker claims the next as it finishes
+```
+
+Workers are a **pool, not a partition**: 100 tasks and 3 workers means each worker keeps
+claiming until the lane is empty. Tune the cost model in `.agents/config.json`
+(`mem_per_browser_worker_mb`, `reserve_mem_mb`, `reserve_cores`, `max_load_per_core`), or
+pass `--force` to ignore the machine ceiling — the only way past it.
 
 `fleet run` opens exactly that many. If the answer is zero it opens nothing and
 tells you how to run the rest in your current session. Override with `fleet run

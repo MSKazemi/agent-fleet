@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: agent-fleet
+message: If you use this software, please cite it as below.
+type: software
+authors:
+  - family-names: Seyedkazemi Ardebili
+    given-names: Mohsen
+    orcid: null
+    website: https://mskazemi.github.io
+repository-code: https://github.com/MSKazemi/agent-fleet
+url: https://mskazemi.github.io/agent-fleet/
+abstract: >-
+  A resource-aware orchestrator that runs many Claude Code sessions in parallel
+  against one shared task queue. Concurrency is derived from the work and from
+  what the host machine can actually spare, rather than from the queue length.
+keywords:
+  - ai-agents
+  - claude-code
+  - parallel-execution
+  - task-queue
+  - resource-aware-scheduling
+  - browser-automation
+license: MIT

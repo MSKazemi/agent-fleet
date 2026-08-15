@@ -67,6 +67,59 @@ check "terminals = one per site, not per task" "2" "$("${FLEET}" plan --count)"
 check "lane-filtered claim leaves browser work alone" "2" "$("${FLEET}" plan --count)"
 
 # --------------------------------------------------------------------------- #
+group "machine awareness"
+
+M="${TMP}/machine"; mkdir -p "${M}"; cd "${M}"; "${FLEET}" init >/dev/null
+for i in $(seq 1 40); do
+  "${FLEET}" add "https://host${i}.example/x" --title "t${i}" >/dev/null
+done
+setcfg() { python3 - "${M}/.agents/config.json" "$@" <<'PYCFG'
+import json, sys
+path, pairs = sys.argv[1], sys.argv[2:]
+cfg = json.load(open(path))
+for pair in pairs:
+    k, _, v = pair.partition("=")
+    cfg[k] = int(v) if v.lstrip("-").isdigit() else v
+json.dump(cfg, open(path, "w"), indent=2)
+PYCFG
+}
+mach() { python3 -c 'import json,sys;print(json.loads(sys.argv[1])["machine"][sys.argv[2]])' \
+         "$("${FLEET}" plan --json)" "$1"; }
+
+check "the queue length never sets the worker count" "1" \
+      "$([[ "$("${FLEET}" plan --count)" -lt 40 ]] && echo 1)"
+
+# a machine with no spare memory must fall back to serial, not refuse or overload
+setcfg max_workers=50 mem_per_browser_worker_mb=2000000 reserve_mem_mb=0
+check "no memory → exactly one worker, not zero" "1" "$("${FLEET}" plan --count)"
+check "and it says so"                           "1" \
+      "$("${FLEET}" plan | grep -c 'one at a time')"
+
+# a roomy machine may go wide, but never past what it can spare
+setcfg mem_per_browser_worker_mb=1 reserve_mem_mb=0 reserve_cores=0
+CAP="$(mach capacity)"
+check "capacity is reported"        "1" "$([[ "${CAP}" -ge 1 ]] && echo 1)"
+check "workers never exceed capacity" "1" \
+      "$([[ "$("${FLEET}" plan --count)" -le "${CAP}" ]] && echo 1)"
+
+# --force is the only way past the machine ceiling
+setcfg mem_per_browser_worker_mb=2000000 reserve_mem_mb=0 max_workers=6
+check "--force overrides the machine ceiling" "6" "$("${FLEET}" plan --count --force)"
+check "without --force it stays safe"         "1" "$("${FLEET}" plan --count)"
+
+# opting out of machine awareness is possible but explicit
+setcfg respect_machine=0
+check "respect_machine=false trusts max_workers" "6" "$("${FLEET}" plan --count)"
+setcfg respect_machine=1
+
+# a container memory limit must be honoured when present
+check "container limits are read when present" "1" \
+      "$(python3 -c "
+import json,sys
+p = json.loads(sys.argv[1])
+print(1 if 'containerised' in p['machine'] else 0)" "$("${FLEET}" plan --json)")"
+
+# --------------------------------------------------------------------------- #
 group "launching without a GUI"
 
 H="${TMP}/headless"; mkdir -p "${H}"; cd "${H}"; "${FLEET}" init >/dev/null

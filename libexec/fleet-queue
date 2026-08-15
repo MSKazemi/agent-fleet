@@ -60,6 +60,18 @@ DEFAULT_CONFIG = {
     "checklist": "",
     # If the checklist has a generated header, the line that ends it.
     "checklist_user_marker": "",
+
+    # --- what this machine can actually take -------------------------------
+    # A browser worker is a Claude session plus its browser tab; an agent-lane
+    # task is a subagent in an existing session. Measured in MB of RSS, rounded
+    # up deliberately: running out of memory costs more than running one fewer
+    # worker. Lower them if your machine is roomier than the defaults assume.
+    "mem_per_browser_worker_mb": 900,
+    "mem_per_agent_task_mb": 350,
+    "reserve_mem_mb": 2048,       # never plan into the last 2 GB
+    "reserve_cores": 2,           # leave the desktop responsive
+    "max_load_per_core": 0.85,    # treat the machine as full above this
+    "respect_machine": True,      # False = trust max_workers alone (not advised)
 }
 
 # How a task gets executed. Only the browser lane costs a terminal.
@@ -729,8 +741,96 @@ def cmd_status(args) -> int:
     return 0
 
 
-def build_plan(max_workers: int | None = None) -> dict:
-    """Schedule the pending queue into lanes. Only the browser lane costs terminals."""
+def _meminfo() -> dict[str, int]:
+    """Total and available memory in MB, from the kernel rather than a guess."""
+    values = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, _, rest = line.partition(":")
+            if key in ("MemTotal", "MemAvailable"):
+                values[key] = int(rest.strip().split()[0]) // 1024
+    except OSError:
+        pass
+    return values
+
+
+def _cgroup_limit_mb() -> int | None:
+    """Honour a container memory limit — the host's RAM is not ours to use."""
+    for path, transform in (
+        ("/sys/fs/cgroup/memory.max", lambda v: None if v.strip() == "max" else int(v)),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", int),
+    ):
+        try:
+            raw = Path(path).read_text().strip()
+            limit = transform(raw)
+            if limit and limit < (1 << 62):
+                return limit // (1024 * 1024)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def probe_machine() -> dict:
+    """What this computer can spare right now."""
+    cfg = config()
+    cores = os.cpu_count() or 1
+    try:
+        load1 = os.getloadavg()[0]
+    except OSError:
+        load1 = 0.0
+
+    mem = _meminfo()
+    total_mb = mem.get("MemTotal", 0)
+    available_mb = mem.get("MemAvailable", total_mb)
+    limit_mb = _cgroup_limit_mb()
+    if limit_mb:
+        total_mb = min(total_mb or limit_mb, limit_mb)
+        available_mb = min(available_mb or limit_mb, limit_mb)
+
+    # Cores not already busy, keeping a couple back for the desktop.
+    idle_cores = cores * cfg["max_load_per_core"] - load1
+    cpu_capacity = int(max(0, min(cores - cfg["reserve_cores"], idle_cores)))
+
+    # Memory we are willing to plan into, above the reserve.
+    spare_mb = max(0, available_mb - cfg["reserve_mem_mb"])
+    mem_capacity = int(spare_mb // cfg["mem_per_browser_worker_mb"])
+
+    capacity = min(cpu_capacity, mem_capacity)
+    if capacity <= 0:
+        bound, capacity = "machine is nearly full — running serially", 1
+    elif mem_capacity < cpu_capacity:
+        bound = "memory"
+    elif cpu_capacity < mem_capacity:
+        bound = "cpu/load"
+    else:
+        bound = "cpu and memory"
+
+    return {
+        "cores": cores, "load1": round(load1, 2),
+        "total_mb": total_mb, "available_mb": available_mb,
+        "containerised": bool(limit_mb),
+        "cpu_capacity": cpu_capacity, "mem_capacity": mem_capacity,
+        "capacity": capacity, "bound_by": bound,
+        "subagent_capacity": max(1, int(max(0, available_mb - cfg["reserve_mem_mb"])
+                                        // cfg["mem_per_agent_task_mb"])),
+    }
+
+
+def build_plan(max_workers: int | None = None, force: bool = False) -> dict:
+    """Schedule the pending queue.
+
+    Concurrency is the *smallest* of four ceilings, so the tightest constraint
+    always wins:
+
+      tasks        never more workers than there is work
+      max_workers  your configured preference
+      hosts        one worker per site, so no host is hit in parallel
+      machine      what this computer can actually spare right now
+
+    Workers are a pool, not a partition: 100 tasks and 3 workers means each
+    worker keeps claiming until the lane is empty. The queue length never
+    decides how many browsers open.
+    """
     cfg = config()
     cap = max_workers or cfg["max_workers"]
     sub_cap = cfg["max_subagents"]
@@ -741,20 +841,23 @@ def build_plan(max_workers: int | None = None) -> dict:
 
     sites = {t.get("site", "") for t in lanes["browser"]}
     sites.discard("")
-    # One terminal per concurrent browser worker; one worker per site at most, so
-    # several agents never hammer the same host in parallel.
-    terminals = min(len(lanes["browser"]), cap, max(len(sites), 1)) if lanes["browser"] else 0
-    subagents = min(len(lanes["agent"]), sub_cap)
 
-    if lanes["browser"]:
-        if len(sites) <= min(len(lanes["browser"]), cap) and len(sites) < len(lanes["browser"]):
-            cap_reason = "one worker per site"
-        elif terminals == cap < len(lanes["browser"]):
-            cap_reason = "max_workers"
-        else:
-            cap_reason = ""
-    else:
-        cap_reason = ""
+    machine = probe_machine() if cfg.get("respect_machine", True) else None
+
+    ceilings = {
+        "tasks": len(lanes["browser"]),
+        "max_workers": cap,
+        "hosts": max(len(sites), 1),
+    }
+    if machine and not force:
+        ceilings["machine"] = machine["capacity"]
+
+    terminals = min(ceilings.values()) if lanes["browser"] else 0
+    bound_by = min(ceilings, key=lambda k: ceilings[k]) if lanes["browser"] else ""
+
+    subagents = min(len(lanes["agent"]), sub_cap)
+    if machine and not force:
+        subagents = min(subagents, machine["subagent_capacity"])
 
     return {
         "pending": len(pending),
@@ -765,15 +868,19 @@ def build_plan(max_workers: int | None = None) -> dict:
         "sites": sorted(sites),
         "max_workers": cap,
         "max_subagents": sub_cap,
-        "cap_reason": cap_reason,
+        "ceilings": ceilings,
+        "bound_by": bound_by,
+        "forced": force,
+        "machine": machine,
         "lanes": {mode: len(tasks) for mode, tasks in lanes.items()},
     }
 
 
 def cmd_plan(args) -> int:
-    """How to run this queue. `--count` prints only the number of terminals needed."""
+    """How to run this queue. `--count` prints only the number of terminals."""
     ensure_dirs()
-    plan = build_plan(args.max)
+    plan = build_plan(args.max, force=getattr(args, "force", False))
+    machine = plan["machine"]
 
     if args.count:
         print(plan["terminals"])
@@ -782,8 +889,18 @@ def cmd_plan(args) -> int:
         print(json.dumps(plan, indent=2))
         return 0
 
+    if machine:
+        shape = (f"{machine['cores']} cores, load {machine['load1']}, "
+                 f"{machine['available_mb'] / 1024:.1f} GB free")
+        if machine["containerised"]:
+            shape += " (container limit honoured)"
+        print(f"machine: {shape}")
+        print(f"         → room for {machine['capacity']} browser worker(s) "
+              f"and {machine['subagent_capacity']} subagent(s), "
+              f"bound by {machine['bound_by']}\n")
+
     if not plan["pending"]:
-        print("nothing queued — add tasks first")
+        print("nothing queued — add work first")
         return 0
 
     print(f"pending: {plan['pending']} task(s)\n")
@@ -792,7 +909,10 @@ def cmd_plan(args) -> int:
         if not count:
             continue
         if mode == "browser":
-            extra = f"→ {plan['terminals']} terminal(s); sites: {', '.join(plan['sites']) or '—'}"
+            shown = plan["sites"][:4]
+            more = len(plan["sites"]) - len(shown)
+            hosts = ", ".join(shown) + (f" +{more} more" if more > 0 else "")
+            extra = f"→ {plan['terminals']} terminal(s); hosts: {hosts or '—'}"
         elif mode == "agent":
             extra = f"→ {plan['subagents']} subagent(s) in parallel, no terminal"
         else:
@@ -801,8 +921,22 @@ def cmd_plan(args) -> int:
         print(f"  {'':<8} {'':>3}            {extra}")
 
     print(f"\nterminals needed: {plan['terminals']}")
-    if plan["cap_reason"]:
-        print(f"  (browser lane capped by {plan['cap_reason']})")
+    if plan["terminals"] == 1 and plan["lanes"]["browser"] > 1:
+        print("  one at a time — this machine has no room for more right now")
+    if plan["bound_by"]:
+        explain = {
+            "tasks": "there is no more browser work than that",
+            "max_workers": f"max_workers is {plan['max_workers']} (config or --max)",
+            "hosts": "one worker per host, so no site is hit in parallel",
+            "machine": f"this machine can spare {plan['ceilings'].get('machine')} "
+                       f"({machine['bound_by'] if machine else ''})",
+        }
+        print(f"  limited by {plan['bound_by']}: {explain.get(plan['bound_by'], '')}")
+    if plan["lanes"]["browser"] > plan["terminals"] > 0:
+        print(f"  the other {plan['lanes']['browser'] - plan['terminals']} browser task(s) "
+              f"wait in the queue — each worker claims the next one as it finishes")
+    if plan["forced"]:
+        print("  --force: machine limits ignored for this run")
     if plan["lanes"]["agent"] or plan["lanes"]["serial"]:
         print("  the agent and serial lanes cost nothing — run them in this session:")
         print("    fleet claim orchestrator --exec agent")
@@ -1022,6 +1156,8 @@ def main() -> int:
     p.add_argument("--max", type=int)
     p.add_argument("--count", action="store_true", help="print only the terminal count")
     p.add_argument("--json", action="store_true", help="machine-readable plan")
+    p.add_argument("--force", action="store_true",
+                   help="ignore what the machine can spare (can overload it)")
     p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("list", help="list tasks")
