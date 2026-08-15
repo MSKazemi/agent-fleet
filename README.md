@@ -75,7 +75,7 @@ agent-fleet is the small amount of machinery that fixes exactly those five thing
 ```bash
 git clone https://github.com/MSKazemi/agent-fleet ~/agent-fleet
 ~/agent-fleet/bin/install      # symlinks `fleet` into ~/.local/bin, the skill into ~/.claude/skills
-~/agent-fleet/bin/selftest     # 43 checks, no browser needed
+~/agent-fleet/bin/selftest     # 60 checks, no browser needed
 ```
 
 Symlinks, not copies — the clone stays the single source of truth, so an edit
@@ -320,7 +320,7 @@ call per repo.
 bin/fleet                 one entry point: dispatch + the launcher
 libexec/fleet-queue       the queue engine (python3, stdlib only)
 bin/install               symlinks into ~/.local/bin and ~/.claude/skills
-bin/selftest              43 headless checks
+bin/selftest              60 headless checks
 skills/agent-fleet/       the skill Claude loads (+ the worker protocol)
 ```
 

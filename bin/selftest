@@ -326,5 +326,21 @@ command -v claude >/dev/null && ok "claude on PATH" \
   || skip "claude CLI" "workers cannot start without it"
 
 # --------------------------------------------------------------------------- #
+group "documentation matches reality"
+
+# The count below includes this check itself, so adding a check makes this fail
+# until the docs are updated — which is the point. Docs that quote a number the
+# suite no longer produces are worse than docs quoting none.
+TOTAL=$((PASS + FAIL + SKIP + 1))
+DRIFT=""
+while read -r hit; do
+  [[ -z "${hit}" ]] && continue
+  file="${hit%%:*}"; num="$(grep -oE '^[0-9]+' <<<"${hit##*:}")"
+  [[ "${num}" == "${TOTAL}" ]] || DRIFT+="${file} says ${num}; "
+done < <(cd "${REPO}" && grep -roE "[0-9]+ (self-tests|checks|headless checks)" \
+         README.md CONTRIBUTING.md docs/index.html skills/ 2>/dev/null)
+check "every documented check count is ${TOTAL}" "" "${DRIFT}"
+
+# --------------------------------------------------------------------------- #
 printf '\n%d passed, %d failed, %d skipped\n' "${PASS}" "${FAIL}" "${SKIP}"
 [[ "${FAIL}" -eq 0 ]]
