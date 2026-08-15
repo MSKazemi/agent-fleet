@@ -8,7 +8,7 @@ authors:
     orcid: null
     website: https://mskazemi.github.io
 repository-code: https://github.com/MSKazemi/agent-fleet
-url: https://mskazemi.github.io/agent-fleet/
+url: https://mskazemi.com/agent-fleet/
 abstract: >-
   A resource-aware orchestrator that runs many Claude Code sessions in parallel
   against one shared task queue. Concurrency is derived from the work and from

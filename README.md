@@ -3,7 +3,7 @@
 [![selftest](https://github.com/MSKazemi/agent-fleet/actions/workflows/selftest.yml/badge.svg)](https://github.com/MSKazemi/agent-fleet/actions/workflows/selftest.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python3 stdlib only](https://img.shields.io/badge/deps-none-informational)](libexec/fleet-queue)
-[![docs](https://img.shields.io/badge/docs-mskazemi.github.io%2Fagent--fleet-E0912F)](https://mskazemi.github.io/agent-fleet/)
+[![docs](https://img.shields.io/badge/docs-mskazemi.com%2Fagent--fleet-E0912F)](https://mskazemi.com/agent-fleet/)
 
 **Run many Claude Code sessions in parallel against one shared task queue — as many as the
 work and your machine can actually take, and no more.**
@@ -12,7 +12,7 @@ work and your machine can actually take, and no more.**
 > re-checked on every run: the work, your cap, one worker per host, and what this computer
 > can spare right now.
 
-📊 **[Architecture and capacity model, illustrated →](https://mskazemi.github.io/agent-fleet/)**
+📊 **[Architecture and capacity model, illustrated →](https://mskazemi.com/agent-fleet/)**
 
 Give it a list of work — URLs to process, forms to fill, repos to migrate,
 questions to research — and it decides how much parallelism the list actually
