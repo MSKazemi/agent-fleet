@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# selftest — prove the fleet works, without touching a browser or a real site.
+#
+#   bin/selftest            run every check in a throwaway project
+#   bin/selftest -v         show each command as it runs
+#
+# Covers everything that can be checked headlessly: project resolution, lane
+# scheduling, the atomic claim race, the full task lifecycle, the note bridge,
+# git hygiene, and tasks.json merging. Anything needing X11 or Chrome is skipped
+# and reported as skipped — never silently passed.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+FLEET="${REPO}/bin/fleet"
+VERBOSE="${1:-}"
+
+PASS=0 FAIL=0 SKIP=0
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/fleet-selftest.XXXXXX")"
+trap 'rm -rf "${TMP}"' EXIT
+
+ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; [[ -n "${2:-}" ]] && printf '      %s\n' "$2"; }
+skip() { SKIP=$((SKIP+1)); printf '  \033[33m-\033[0m %s (skipped: %s)\n' "$1" "$2"; }
+group(){ printf '\n%s\n' "$1"; }
+
+# check NAME EXPECTED ACTUAL
+check() {
+  [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "expected [$2], got [$3]"
+}
+
+run() { [[ "${VERBOSE}" == "-v" ]] && echo "    \$ $*" >&2; "$@"; }
+
+# --------------------------------------------------------------------------- #
+group "project resolution"
+
+P="${TMP}/alpha"; mkdir -p "${P}/src/deep"
+(cd "${P}" && run "${FLEET}" init >/dev/null)
+check "init creates the queue" "yes" "$([[ -d "${P}/.agents/queue/inbox" ]] && echo yes)"
+check "resolves from a nested subdir" "${P}" \
+      "$(cd "${P}/src/deep" && "${FLEET}" where | awk '/^root:/{print $2}')"
+
+Q="${TMP}/beta"; mkdir -p "${Q}"
+(cd "${Q}" && run "${FLEET}" init >/dev/null)
+(cd "${P}" && "${FLEET}" add "https://a.example/1" --title A >/dev/null)
+(cd "${Q}" && "${FLEET}" add "https://b.example/1" --title B >/dev/null)
+check "two projects stay independent" "1" \
+      "$(cd "${Q}" && "${FLEET}" plan --count)"
+
+# --------------------------------------------------------------------------- #
+group "lane scheduling"
+
+W="${TMP}/lanes"; mkdir -p "${W}"; cd "${W}"; "${FLEET}" init >/dev/null
+"${FLEET}" add "https://site-one.example/a" --title one   >/dev/null
+"${FLEET}" add "https://site-one.example/b" --title two   >/dev/null
+"${FLEET}" add "https://site-two.example/c" --title three >/dev/null
+"${FLEET}" add "write a summary of the three roles" --kind research >/dev/null
+"${FLEET}" add "update the CV master file" --serial >/dev/null
+
+PLAN="$("${FLEET}" plan --json)"
+lane() { python3 -c "import json,sys;print(json.loads(sys.argv[1])['lanes'][sys.argv[2]])" "${PLAN}" "$1"; }
+check "URLs infer the browser lane"      "3" "$(lane browser)"
+check "plain text infers the agent lane" "1" "$(lane agent)"
+check "--serial forces the serial lane"  "1" "$(lane serial)"
+check "terminals = one per site, not per task" "2" "$("${FLEET}" plan --count)"
+
+"${FLEET}" claim w1 --exec agent >/dev/null
+check "lane-filtered claim leaves browser work alone" "2" "$("${FLEET}" plan --count)"
+
+# --------------------------------------------------------------------------- #
+group "launching without a GUI"
+
+H="${TMP}/headless"; mkdir -p "${H}"; cd "${H}"; "${FLEET}" init >/dev/null
+"${FLEET}" add "https://headless.example/1" --title h1 >/dev/null
+DRY="$("${FLEET}" run --headless --dry 2>&1)"
+check "headless --dry starts nothing"   "1" "$(grep -c 'would start 1 headless' <<<"${DRY}")"
+check "worker carries its own AGENT_ID" "1" "$(grep -c 'AGENT_ID=agent-1' <<<"${DRY}")"
+
+"${FLEET}" launch 2 --headless --cmd "sleep 3" >/dev/null 2>&1
+check "headless launch writes a log per worker" "2" \
+      "$(ls .agents/logs/agent-*.log 2>/dev/null | grep -c .)"
+
+# a kind whose skills live elsewhere must start there, queue unchanged
+ELSEWHERE="${TMP}/toolbox"; mkdir -p "${ELSEWHERE}"
+python3 - "${H}/.agents/config.json" "${ELSEWHERE}" <<'PYCFG'
+import json, sys
+path, elsewhere = sys.argv[1], sys.argv[2]
+cfg = json.load(open(path))
+cfg["workers_start_in_by_kind"] = {"special": elsewhere}
+json.dump(cfg, open(path, "w"), indent=2)
+PYCFG
+"${FLEET}" add "https://special.example/1" --kind special --title s1 >/dev/null
+CWD_FOR_KIND="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["worker_cwd"])' \
+                "$("${FLEET}" plan --json)")"
+check "workers follow their kind's skills" "${ELSEWHERE}" "${CWD_FOR_KIND}"
+
+python3 - "${H}/.agents/config.json" <<'PYCFG'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["workers_start_in_by_kind"] = {"special": "/nonexistent/path"}
+json.dump(cfg, open(sys.argv[1], "w"), indent=2)
+PYCFG
+check "doctor catches a missing workers_start_in" "1" \
+      "$("${FLEET}" doctor >/dev/null 2>&1; echo $?)"
+python3 - "${H}/.agents/config.json" <<'PYCFG'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["workers_start_in_by_kind"] = {}
+json.dump(cfg, open(sys.argv[1], "w"), indent=2)
+PYCFG
+check "doctor accepts a solvable scope" "0" "$("${FLEET}" doctor >/dev/null 2>&1; echo $?)"
+
+# --------------------------------------------------------------------------- #
+group "atomic claim"
+
+R="${TMP}/race"; mkdir -p "${R}"; cd "${R}"; "${FLEET}" init >/dev/null
+for i in 1 2 3 4; do "${FLEET}" add "https://race.example/${i}" --title "r${i}" >/dev/null; done
+for i in $(seq 1 8); do
+  ("${FLEET}" claim "racer-${i}" 2>/dev/null | python3 -c \
+     "import sys,json;d=sys.stdin.read().strip();print(json.loads(d)['id']) if d else None") &
+done >"${TMP}/winners.txt"
+wait
+WON=$(grep -c . "${TMP}/winners.txt" || true)
+UNIQ=$(sort -u "${TMP}/winners.txt" | grep -c . || true)
+check "8 agents, 4 tasks → 4 winners"   "4" "${WON}"
+check "no task claimed twice"           "${WON}" "${UNIQ}"
+
+# --------------------------------------------------------------------------- #
+group "task lifecycle"
+
+L="${TMP}/life"; mkdir -p "${L}"; cd "${L}"; "${FLEET}" init >/dev/null
+"${FLEET}" add "https://life.example/1" --title keep >/dev/null
+ID="$("${FLEET}" claim solo | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+"${FLEET}" block "${ID}" --reason "login required: example" >/dev/null
+check "block parks the task"       "1" "$("${FLEET}" list blocked | grep -c "${ID}")"
+"${FLEET}" unblock --all >/dev/null
+check "unblock returns it"         "1" "$("${FLEET}" plan --count)"
+check "unblock with no id refuses" "2" "$("${FLEET}" unblock >/dev/null 2>&1; echo $?)"
+"${FLEET}" claim solo >/dev/null
+"${FLEET}" reset --older-than 0 >/dev/null
+check "reset recovers a dead agent's task" "1" "$("${FLEET}" plan --count)"
+ID="$("${FLEET}" claim solo | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+"${FLEET}" done "${ID}" --result "confirmation #1" >/dev/null
+check "done empties the queue"     "0" "$("${FLEET}" plan --count)"
+check "claim on empty exits 3"     "3" "$("${FLEET}" claim solo >/dev/null 2>&1; echo $?)"
+
+# --------------------------------------------------------------------------- #
+group "git hygiene"
+
+G="${TMP}/repo"; mkdir -p "${G}/.vscode"; cd "${G}"
+git init -q .
+printf 'node_modules/\n' > .gitignore
+cat > .vscode/tasks.json <<'JSON'
+{
+  "version": "2.0.0",
+  // the project's own build task
+  "tasks": [
+    { "label": "build", "type": "shell", "command": "make all",
+      "group": { "kind": "build", "isDefault": true }, }
+  ]
+}
+JSON
+printf 'x\n' > src.txt
+git add -A >/dev/null
+git -c user.email=t@e -c user.name=t -c commit.gpgsign=false commit -qm init --no-verify >/dev/null 2>&1
+BEFORE_IGNORE="$(cat .gitignore)"
+"${FLEET}" init >/dev/null
+check "init leaves the repo clean"      "" "$(git status --porcelain)"
+check "init does not touch .gitignore"  "${BEFORE_IGNORE}" "$(cat .gitignore)"
+check ".agents/ is excluded"            "0" "$(git check-ignore -q .agents; echo $?)"
+
+"${FLEET}" add "https://g.example/1" --title g >/dev/null
+"${FLEET}" run --terminals --dry >/dev/null 2>&1   # force the tasks.json path
+LABELS="$(python3 -c "
+import json;print(','.join(t['label'] for t in json.load(open('.vscode/tasks.json'))['tasks']))")"
+check "merge keeps the project's task"  "build,agent-1,agents: all" "${LABELS}"
+check "our compound task is the default" "True" "$(python3 -c "
+import json
+t=[x for x in json.load(open('.vscode/tasks.json'))['tasks'] if x['label']=='agents: all'][0]
+print(t['group']['isDefault'])")"
+check "the project's default was demoted" "False" "$(python3 -c "
+import json
+t=[x for x in json.load(open('.vscode/tasks.json'))['tasks'] if x['label']=='build'][0]
+print(t['group']['isDefault'])")"
+"${FLEET}" clean >/dev/null
+check "clean restores the original"     "" "$(git status --porcelain)"
+
+# a queue that leaked into git must be caught
+mkdir -p .agents/queue/inbox && echo '{}' > .agents/queue/inbox/leak.json
+git add -f .agents >/dev/null 2>&1
+check "doctor detects a tracked queue"  "1" "$("${FLEET}" doctor >/dev/null 2>&1; echo $?)"
+"${FLEET}" doctor --fix >/dev/null 2>&1
+check "doctor --fix untracks it"        "0" "$(git ls-files -- .agents | grep -c . || true)"
+
+# --------------------------------------------------------------------------- #
+group "checklist bridge"
+
+N="${TMP}/checklist"; mkdir -p "${N}"; cd "${N}"; "${FLEET}" init >/dev/null
+cat > TASKS.md <<'MD'
+# Backlog
+
+## READY
+
+- [ ] `N1` · apply at https://note.example/form
+  - why: it is the first real one
+  - [ ] sub-step that must not become its own task
+- [ ] ! `N2` · draft the summary
+- [ ] `N3` · ⇒ · update the changelog
+- [ ] ? `N4` · which option should I take
+- [ ] 🔒 `N5` · hands off
+- [x] `N6` · already done
+MD
+OUT="$("${FLEET}" from-note)"
+check "checklist items become tasks"   "3" "$(grep -cE '^[0-9a-f]{8} ' <<<"${OUT}")"
+check "? and 🔒 are never queued"      "1" "$(grep -c 'skipped 2' <<<"${OUT}")"
+check "! raises priority"              "1" "$("${FLEET}" list inbox | grep -c 'p2 ')"
+check "⇒ forces the serial lane"       "1" "$("${FLEET}" list inbox | grep -c 'serial')"
+check "sub-steps stay with their task" "0" "$("${FLEET}" list inbox | grep -c 'sub-step')"
+check "re-running does not duplicate"  "3" \
+      "$("${FLEET}" from-note >/dev/null; "${FLEET}" list inbox | grep -cE '^  [0-9a-f]{8}')"
+
+cp TASKS.md "${TMP}/checklist.before"
+NID="$("${FLEET}" list inbox | awk '/N1/{print $1}')"
+"${FLEET}" done "${NID}" --result "submitted; confirmation #9" >/dev/null
+"${FLEET}" to-note >/dev/null
+check "write-back ticks exactly one line" "1" \
+      "$(diff "${TMP}/checklist.before" TASKS.md | grep -c '^> - \[x\]')"
+check "write-back is idempotent"       "nothing to write back" "$("${FLEET}" to-note)"
+
+# --------------------------------------------------------------------------- #
+group "environment (needed only to open terminals)"
+
+[[ "${XDG_SESSION_TYPE:-}" == "x11" ]] && ok "X11 session" \
+  || skip "X11 session" "XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unset}; fleet run/open cannot work"
+command -v xdotool >/dev/null && ok "xdotool installed" \
+  || skip "xdotool" "install it to open terminals"
+command -v notify-send >/dev/null && ok "notify-send installed" \
+  || skip "notify-send" "blocked tasks will not raise a desktop notification"
+command -v claude >/dev/null && ok "claude on PATH" \
+  || skip "claude CLI" "workers cannot start without it"
+
+# --------------------------------------------------------------------------- #
+printf '\n%d passed, %d failed, %d skipped\n' "${PASS}" "${FAIL}" "${SKIP}"
+[[ "${FAIL}" -eq 0 ]]

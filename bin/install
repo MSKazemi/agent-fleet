@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# install — make the fleet available in every project on this machine.
+#
+#   bin/install              symlink the command and the skills
+#   bin/install --uninstall  remove those symlinks
+#
+# Symlinks, not copies: this repo stays the single source of truth, so editing
+# libexec/fleet-queue here changes behaviour everywhere immediately.
+#
+# Safe to re-run. Because the links are path-based, re-running is also how you
+# repair them after moving or renaming this repo.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+BIN_DIR="${HOME}/.local/bin"
+SKILL_DIR="${HOME}/.claude/skills"
+SKILLS=(agent-fleet)
+LEGACY_NAMES=(agents inbox)          # superseded by the single `fleet` command
+LEGACY_SKILLS=(mska-agent-fleet mska-note)   # earlier names/locations of the skill
+
+ours() { [[ -L "$1" ]] && [[ "$(readlink "$1")" == "${REPO}"/* ]]; }
+
+link() {
+  local src="$1" dest="$2"
+  if [[ -L "${dest}" ]]; then
+    if [[ "$(readlink "${dest}")" == "${src}" ]]; then
+      [[ -e "${dest}" ]] && { echo "  ok       ${dest}"; return; }
+      echo "  broken   ${dest} (target missing) — relinking"
+    fi
+    rm "${dest}"
+  elif [[ -e "${dest}" ]]; then
+    echo "  SKIPPED  ${dest} exists and is not a symlink — move it aside first" >&2
+    return
+  fi
+  ln -s "${src}" "${dest}"
+  echo "  linked   ${dest} -> ${src}"
+}
+
+drop() {
+  local dest="$1"
+  if [[ -L "${dest}" ]] && ours "${dest}"; then
+    rm "${dest}"; echo "  removed  ${dest}"
+  elif [[ -e "${dest}" || -L "${dest}" ]]; then
+    echo "  skipped  ${dest} (not ours)"
+  fi
+}
+
+if [[ "${1:-}" == "--uninstall" ]]; then
+  echo "uninstalling:"
+  drop "${BIN_DIR}/fleet"
+  for name in "${LEGACY_NAMES[@]}"; do drop "${BIN_DIR}/${name}"; done
+  for skill in "${SKILLS[@]}"; do drop "${SKILL_DIR}/${skill}"; done
+  exit 0
+fi
+
+mkdir -p "${BIN_DIR}" "${SKILL_DIR}"
+
+echo "installing from ${REPO}:"
+link "${REPO}/bin/fleet" "${BIN_DIR}/fleet"
+for skill in "${SKILLS[@]}"; do
+  link "${REPO}/skills/${skill}" "${SKILL_DIR}/${skill}"
+done
+
+# The old two-command layout, if this machine still has it.
+for name in "${LEGACY_NAMES[@]}"; do
+  if [[ -L "${BIN_DIR}/${name}" ]] && ours "${BIN_DIR}/${name}"; then
+    rm "${BIN_DIR}/${name}"
+    echo "  removed  ${BIN_DIR}/${name} (replaced by 'fleet ${name/agents/run}')"
+  fi
+done
+
+# Skills this repo used to install under other names.
+for skill in "${LEGACY_SKILLS[@]}"; do
+  if [[ -L "${SKILL_DIR}/${skill}" ]] && ours "${SKILL_DIR}/${skill}"; then
+    rm "${SKILL_DIR}/${skill}"
+    echo "  removed  ${SKILL_DIR}/${skill} (renamed to agent-fleet)"
+  fi
+done
+
+echo
+case ":${PATH}:" in
+  *":${BIN_DIR}:"*) echo "PATH: ${BIN_DIR} is on PATH ✓" ;;
+  *) echo "PATH: add ${BIN_DIR} to PATH in ~/.bashrc to use 'fleet' directly" ;;
+esac
+
+echo
+echo "verify:   $(command -v fleet || echo 'fleet NOT on PATH')"
+echo "test:     ${REPO}/bin/selftest"
+echo
+echo "start in any project:"
+echo "  cd ~/some/project && fleet init"
+echo "  fleet add <url> --title ...      # or: fleet from-note"
+echo "  fleet plan && fleet run"

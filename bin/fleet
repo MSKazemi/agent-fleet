@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+# fleet — run parallel Claude agents against a per-project task queue.
+#
+# One command, two halves: queue subcommands are handled by libexec/fleet-queue,
+# window subcommands (which drive VS Code through xdotool) are handled here.
+#
+# The project is resolved from where you ARE, not from where this script lives:
+# $AGENT_ROOT, else the nearest ancestor holding .agents/, else the git root,
+# else $PWD. One installed copy serves every repo on the machine.
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO="$(cd "$(dirname "${SELF}")/.." && pwd)"
+QUEUE_BIN="${REPO}/libexec/fleet-queue"
+DEFAULT_DELAY=10
+
+die() { echo "fleet: $*" >&2; exit 1; }
+
+[[ -x "${QUEUE_BIN}" ]] || die "queue engine missing at ${QUEUE_BIN} (re-run bin/install)"
+
+resolve_root() {
+  if [[ -n "${AGENT_ROOT:-}" ]]; then echo "${AGENT_ROOT}"; return; fi
+  local dir="${PWD}"
+  while [[ "${dir}" != "/" ]]; do
+    [[ -d "${dir}/.agents" ]] && { echo "${dir}"; return; }
+    dir="$(dirname "${dir}")"
+  done
+  local top
+  top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  echo "${top:-${PWD}}"
+}
+
+ROOT="$(resolve_root)"
+PROJECT="$(basename "${ROOT}")"
+TASKS="${ROOT}/.vscode/tasks.json"
+
+queue() { AGENT_ROOT="${ROOT}" "${QUEUE_BIN}" "$@"; }
+
+# --------------------------------------------------------------------------- #
+# help
+# --------------------------------------------------------------------------- #
+
+usage() {
+  cat <<'EOF'
+fleet — parallel Claude agents against a per-project task queue
+
+SETUP
+  fleet init [--max-workers N]   set this project up (queue + git exclude rule)
+  fleet where                    which project's queue is in scope
+  fleet doctor [--fix]           prove nothing can leak, and that work is runnable
+
+QUEUE WORK
+  fleet add URL|TEXT [--title T] [--note N] [--priority 1-9] [--kind K]
+                     [--exec browser|agent|serial] [--serial]
+  fleet add-batch [FILE|-]       one per line: 'URL | title | note'
+  fleet from-note [--section S]  promote checklist items (TASKS.md) into the queue
+  fleet to-note                  tick finished items in the note, log them
+
+RUN IT
+  fleet plan [--max N]           the schedule: lanes, terminals, and why
+  fleet run [N] [--max N] [--delay S] [--headless|--terminals] [--dry]
+                                 start the browser lane; terminals when X11 is
+                                 available, detached processes otherwise
+  fleet open N                   N empty terminals, nothing started
+  fleet launch N --cmd C [--headless]   N workers all running C
+
+WATCH IT
+  fleet status                   project, agents, queue counts
+  fleet list [STATE]             tasks by state
+  fleet watch                    live counters
+  fleet blocked                  what needs you, grouped by reason
+  fleet unblock ID | --all       release blocked task(s) back to the queue
+  fleet reset [--older-than S]   recover tasks from an agent that died
+  fleet clean                    remove the generated .vscode/tasks.json
+
+FOR AGENTS
+  fleet claim AGENT [--exec LANE]        take the next task (exit 3 = lane empty)
+  fleet done  ID --result "..."          finish, with the confirmation you saw
+  fleet block ID --reason "..."          needs a human; notifies and frees you
+  fleet fail  ID --reason "..."          give up
+  fleet show  ID                         one task as JSON
+
+Any subcommand takes --help for its own options.
+Docs: the agent-fleet skill, or README.md in this tool's repo.
+EOF
+}
+
+# --------------------------------------------------------------------------- #
+# window / launcher half
+# --------------------------------------------------------------------------- #
+
+gui_available() {
+  [[ "${XDG_SESSION_TYPE:-}" == "x11" ]] && command -v xdotool >/dev/null
+}
+
+gui_missing_reason() {
+  [[ "${XDG_SESSION_TYPE:-}" == "x11" ]] \
+    || { echo "not an X11 session (XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unset})"; return; }
+  echo "xdotool is not installed (apt install xdotool)"
+}
+
+require_gui() {
+  gui_available || die "$(gui_missing_reason); use --headless to run without terminals"
+}
+
+# Start workers as detached background processes instead of VS Code terminals.
+# No X11, no window, no focus stolen — the trade is that you read progress from
+# .agents/logs/agent-N.log instead of watching a terminal panel.
+launch_headless() {
+  local cwd="$1" n="$2"; shift 2
+  local cmds=("$@") i pid logfile started=0 alive=0 pids=()
+  mkdir -p "${ROOT}/.agents/logs"
+  for i in $(seq 1 "${n}"); do
+    logfile="${ROOT}/.agents/logs/agent-${i}.log"
+    setsid bash -c "cd '${cwd}' && ${cmds[$((i-1))]}" >>"${logfile}" 2>&1 &
+    pid=$!
+    pids+=("${pid}")
+    kill -0 "${pid}" 2>/dev/null && started=$((started + 1))
+    echo "  agent-${i}  pid ${pid}  → ${logfile}"
+  done
+  sleep 5
+  for pid in "${pids[@]}"; do kill -0 "${pid}" 2>/dev/null && alive=$((alive + 1)); done
+  echo "started ${started}/${n}; still running after 5s: ${alive}"
+  if [[ "${started}" -lt "${n}" ]]; then
+    echo "WARNING: not every worker started — read .agents/logs/agent-*.log" >&2
+    return 1
+  fi
+  [[ "${alive}" -lt "${n}" ]] && echo "note: $(( n - alive )) already exited — that is normal for a short queue, but check the logs if unexpected"
+  echo "follow them with:  tail -f ${ROOT}/.agents/logs/agent-*.log"
+  return 0
+}
+
+# Prefer the window carrying this project; else, if exactly one VS Code window is
+# open, use it; else refuse rather than drive the wrong project's window.
+vscode_window() {
+  local win all
+  win="$(xdotool search --name " - ${PROJECT} - Visual Studio Code" 2>/dev/null | head -1)"
+  [[ -n "${win}" ]] && { echo "${win}"; return; }
+  all="$(xdotool search --name "Visual Studio Code$" 2>/dev/null || true)"
+  if [[ "$(wc -l <<<"${all}")" -eq 1 && -n "${all}" ]]; then echo "${all}"; return; fi
+  die "no VS Code window for '${PROJECT}' — open ${ROOT} in VS Code first"
+}
+
+count_shells() { pgrep -c -u "$(id -u)" bash || true; }
+
+# Count only the agents working THIS project. Every worker is started with
+# AGENT_ROOT in its environment, which survives `exec` — unlike the command line,
+# and unlike the cwd, which may be another repo when workers_start_in is set.
+# A machine-wide
+# pgrep would count every unrelated Claude session and make the check meaningless.
+count_agents() {
+  local pid count=0
+  for pid in $(pgrep -f -u "$(id -u)" 'claude --dangerously-skip-permissions' 2>/dev/null || true); do
+    if grep -qz "AGENT_ROOT=${ROOT}" "/proc/${pid}/environ" 2>/dev/null \
+       || [[ "$(readlink -f "/proc/${pid}/cwd" 2>/dev/null)" == "${ROOT}" ]]; then
+      count=$((count + 1))
+    fi
+  done
+  echo "${count}"
+}
+
+send_key() {
+  local win="$1" key="$2"
+  xdotool windowactivate --sync "${win}" 2>/dev/null
+  xdotool key --clearmodifiers "${key}"
+}
+
+# write_tasks DELAY CMD...  — one task per CMD plus a compound default build task.
+# JSON is emitted by python3 so commands containing quotes cannot corrupt it, and
+# any tasks the project already had are preserved.
+write_tasks() {
+  local delay="$1"; shift
+  mkdir -p "${ROOT}/.vscode" "${ROOT}/.agents"
+  python3 - "${TASKS}" "${delay}" "${ROOT}/.agents/tasks.json.orig" "$@" <<'PY'
+import json, os, re, shutil, sys
+out, delay, orig, cmds = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+
+OURS = re.compile(r"agent-\d+$")
+
+
+def load(path):
+    """tasks.json is JSONC in practice — tolerate // comments and trailing commas."""
+    raw = open(path).read()
+    for candidate in (raw,
+                      re.sub(r",(\s*[}\]])", r"\1",
+                             re.sub(r"^\s*//.*$", "", raw, flags=re.M))):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+document, kept = {}, []
+if os.path.exists(out):
+    data = load(out)
+    if data is None:
+        shutil.copy(out, out + ".backup")
+        print(f"warning: could not parse {out}; backed it up to {out}.backup",
+              file=sys.stderr)
+    else:
+        document = data
+        kept = [t for t in data.get("tasks", [])
+                if not OURS.match(t.get("label", "")) and t.get("label") != "agents: all"]
+        if kept and not os.path.exists(orig):
+            shutil.copy(out, orig)     # pristine copy, restored by `fleet clean`
+            print(f"kept {len(kept)} existing task(s); original saved to {orig}",
+                  file=sys.stderr)
+
+tasks = []
+for i, cmd in enumerate(cmds, start=1):
+    label = f"agent-{i}"
+    prefix = f"echo '[{label}] starting in {delay}s'; sleep {delay}; " if delay != "0" else ""
+    tasks.append({
+        "label": label,
+        "type": "shell",
+        "command": prefix + cmd,
+        "isBackground": True,
+        "presentation": {"panel": "dedicated", "group": "agents", "focus": False},
+        "problemMatcher": [],
+    })
+tasks.append({
+    "label": "agents: all",
+    "dependsOn": [t["label"] for t in tasks],
+    "dependsOrder": "parallel",
+    "group": {"kind": "build", "isDefault": True},
+    "problemMatcher": [],
+})
+
+# Our compound task must be the only default build task, or Ctrl+Shift+B asks.
+for task in kept:
+    group = task.get("group")
+    if isinstance(group, dict) and group.get("isDefault"):
+        task["group"] = {**group, "isDefault": False}
+
+document.setdefault("version", "2.0.0")
+document["tasks"] = kept + tasks
+with open(out, "w") as fh:
+    json.dump(document, fh, indent=2)
+    fh.write("\n")
+PY
+}
+
+trigger_tasks() {
+  local n="$1" delay="$2" win before after
+  require_gui
+  win="$(vscode_window)"
+  before="$(count_agents)"
+  send_key "${win}" ctrl+shift+b
+  echo "started the build task; waiting $((delay + 12))s for the agents to come up..."
+  sleep "$((delay + 12))"
+  after="$(count_agents)"
+  echo "agents in ${PROJECT}: ${before} -> ${after}"
+  [[ "${after}" -ge "$((before + n))" ]] || cat >&2 <<EOF
+WARNING: expected ${n} new agent(s) but see $((after - before)).
+  If VS Code showed a task picker, run 'Tasks: Run Build Task' once by hand.
+  If a worker exited immediately, check the terminal panel for its error.
+EOF
+}
+
+cmd_open() {
+  local n="${1:-1}" win before after
+  require_gui
+  win="$(vscode_window)"
+  before="$(count_shells)"
+  for _ in $(seq 1 "${n}"); do
+    send_key "${win}" ctrl+shift+grave
+    sleep 1
+  done
+  sleep 1
+  after="$(count_shells)"
+  echo "opened ${n} terminal(s) in window ${win}; shells: ${before} -> ${after}"
+  [[ "${after}" -gt "${before}" ]] || die "shell count did not grow — no terminal appeared"
+}
+
+cmd_launch() {
+  local n=1 delay="${DEFAULT_DELAY}" headless=0 cmd="claude --dangerously-skip-permissions" cmds=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --delay)    delay="${2:?--delay needs seconds}"; shift 2 ;;
+      --cmd)      cmd="${2:?--cmd needs a command}"; shift 2 ;;
+      --headless) headless=1; shift ;;
+      [0-9]*)     n="$1"; shift ;;
+      -h|--help)  echo "usage: fleet launch N --cmd C [--delay S] [--headless]"; return 0 ;;
+      *)          die "unknown argument: $1" ;;
+    esac
+  done
+  for _ in $(seq 1 "${n}"); do cmds+=("${cmd}"); done
+  if [[ "${headless}" -eq 1 ]]; then
+    echo "starting ${n} headless process(es):"
+    launch_headless "${ROOT}" "${n}" "${cmds[@]}"
+    return
+  fi
+  write_tasks "${delay}" "${cmds[@]}"
+  echo "wrote ${TASKS} (${n} task(s), delay ${delay}s, command: ${cmd})"
+  trigger_tasks "${n}" "${delay}"
+}
+
+# The worker prompt is embedded in a single-quoted shell string inside a JSON
+# string, so it deliberately contains no single quotes.
+worker_prompt() {
+  local id="$1"
+  echo "You are ${id}, one browser worker in a parallel fleet. Load the agent-fleet skill and follow its worker protocol reference exactly: claim a task with fleet claim ${id} --exec browser, do it in your own Chrome tab, then report it with fleet done/block/fail. Repeat until fleet claim reports the lane is empty, then stop and print a summary of what you completed."
+}
+
+cmd_run() {
+  local n="" delay="${DEFAULT_DELAY}" dry=0 max="" headless="" i cmds=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --delay)    delay="${2:?--delay needs seconds}"; shift 2 ;;
+      --max)      max="${2:?--max needs a number}"; shift 2 ;;
+      --dry)      dry=1; shift ;;
+      --headless) headless=1; shift ;;
+      --terminals) headless=0; shift ;;
+      auto)       n=""; shift ;;
+      [0-9]*)     n="$1"; shift ;;
+      -h|--help)  cat <<'EOF'
+usage: fleet run [N] [--max N] [--delay S] [--headless|--terminals] [--dry]
+
+  N            how many browser workers (default: whatever `fleet plan` says)
+  --max N      cap the worker count for this run
+  --delay S    seconds before each worker starts (default 10; terminals only)
+  --headless   run workers as background processes, logging to .agents/logs/
+               (no X11, no VS Code, no focus stolen). Chosen automatically when
+               no usable X11 session is present.
+  --terminals  force VS Code terminals even if X11 looks unavailable
+  --dry        write .vscode/tasks.json and stop
+EOF
+                  return 0 ;;
+      *)          die "unknown argument: $1" ;;
+    esac
+  done
+
+  [[ -d "${ROOT}/.agents" ]] || die "no fleet project here — run: fleet init"
+
+  # Size the fleet from the queue itself unless a count was given. Only the
+  # browser lane needs terminals; agent and serial work runs in-session for free.
+  if [[ -z "${n}" ]]; then
+    echo "queue plan:"
+    queue plan ${max:+--max "${max}"} | sed 's/^/  /'
+    n="$(queue plan --count ${max:+--max "${max}"})"
+    if [[ "${n}" -eq 0 ]]; then
+      echo
+      echo "no terminal needed for this queue."
+      python3 - "$(queue plan --json)" <<'PY'
+import json, sys
+plan = json.loads(sys.argv[1])
+if plan["pending"] == 0:
+    print("  nothing queued — add work with: fleet add ...")
+else:
+    print("  run the remaining lanes here, without terminals:")
+    if plan["lanes"]["agent"]:
+        print(f"    {plan['lanes']['agent']} agent task(s):  fleet claim orchestrator "
+              f"--exec agent   ({plan['subagents']} in parallel)")
+    if plan["lanes"]["serial"]:
+        print(f"    {plan['lanes']['serial']} serial task(s): fleet claim orchestrator "
+              f"--exec serial  (one at a time)")
+PY
+      return 0
+    fi
+  fi
+
+  # Skills load from the working directory, so workers_start_in can point a kind
+  # of work at the repo holding its skills, while AGENT_ROOT keeps the queue here.
+  local cwd
+  cwd="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["worker_cwd"])' \
+         "$(queue plan --json)")"
+  [[ "${cwd}" == "${ROOT}" ]] || echo "workers start in ${cwd} (workers_start_in), queue stays ${ROOT}"
+
+  # Headless unless a usable X11 session is available, or forced either way.
+  if [[ -z "${headless}" ]]; then
+    if gui_available; then headless=0; else
+      headless=1
+      echo "no usable X11 ($(gui_missing_reason)) — running headless"
+    fi
+  fi
+
+  for i in $(seq 1 "${n}"); do
+    cmds+=("AGENT_ROOT=${ROOT} AGENT_ID=agent-${i} exec claude --dangerously-skip-permissions '$(worker_prompt "agent-${i}")'")
+  done
+
+  if [[ "${headless}" -eq 1 ]]; then
+    if [[ "${dry}" -eq 1 ]]; then
+      echo "--dry: would start ${n} headless worker(s) in ${cwd}:"
+      printf '  %s\n' "${cmds[@]}"
+      return 0
+    fi
+    echo "starting ${n} headless worker(s):"
+    launch_headless "${cwd}" "${n}" "${cmds[@]}"
+    return
+  fi
+
+  local prefixed=() c
+  for c in "${cmds[@]}"; do prefixed+=("cd ${cwd} && ${c}"); done
+  write_tasks "${delay}" "${prefixed[@]}"
+  echo "wrote ${TASKS} (${n} browser worker(s), delay ${delay}s)"
+  [[ "${dry}" -eq 1 ]] && { echo "--dry: tasks file written, nothing started"; return 0; }
+  trigger_tasks "${n}" "${delay}"
+}
+
+cmd_status() {
+  echo "project:  ${PROJECT}  (${ROOT})"
+  echo "agents:   $(count_agents) running here"
+  [[ -f "${TASKS}" ]] && echo "tasks:    ${TASKS}" || echo "tasks:    (none generated)"
+  if [[ -d "${ROOT}/.agents" ]]; then
+    printf 'queue:    '
+    queue status
+  else
+    echo "queue:    (not initialised — run 'fleet init')"
+  fi
+}
+
+cmd_clean() {
+  local orig="${ROOT}/.agents/tasks.json.orig"
+  if [[ -f "${orig}" ]]; then
+    mv "${orig}" "${TASKS}"
+    echo "restored the project's original ${TASKS}"
+  else
+    rm -f "${TASKS}"
+    rmdir "${ROOT}/.vscode" 2>/dev/null || true
+    echo "removed ${TASKS}"
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+
+case "${1:-}" in
+  # window half
+  run)    shift; cmd_run "$@" ;;
+  open)   shift; cmd_open "$@" ;;
+  launch) shift; cmd_launch "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  clean)  shift; cmd_clean "$@" ;;
+
+  # queue half
+  init|where|doctor|add|add-batch|from-note|to-note|plan|list|watch|blocked|\
+  unblock|reset|claim|done|block|fail|show)
+          queue "$@" ;;
+
+  ""|help|-h|--help) usage ;;
+  *) echo "fleet: unknown command '$1'" >&2; echo >&2; usage >&2; exit 2 ;;
+esac

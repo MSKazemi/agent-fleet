@@ -1,0 +1,1080 @@
+#!/usr/bin/env python3
+"""fleet queue engine — a per-project task queue for a fleet of parallel agents.
+
+Runs in ANY project. The queue lives next to the work, not next to this script:
+
+    $AGENT_ROOT               if set, wins outright
+    nearest ancestor with .agents/     the usual case, created by `fleet init`
+    git repository root       first run in a repo
+    $PWD                      last resort
+
+so `fleet add` in ~/work/foo and in ~/work/bar feed two independent queues, and
+several fleets can run at once in different projects without touching each other.
+
+Runtime state lives in <root>/.agents/ — tasks are one JSON file each, in a
+directory that IS their state:
+
+    .agents/queue/inbox/    waiting to be claimed
+    .agents/queue/active/   claimed by an agent, in progress
+    .agents/queue/blocked/  needs a human (login, captcha, 2FA) — agent moved on
+    .agents/queue/done/     finished, with evidence
+    .agents/queue/failed/   gave up after retries
+
+Claiming is a single os.rename() out of queue/inbox/. rename(2) is atomic, so
+when several agents race for the same task exactly one wins and the losers get
+FileNotFoundError and try the next file. No lock files, no daemon.
+
+Human commands:  init, where, doctor, add, add-batch, from-note, to-note,
+                 plan, list, status, watch, blocked, unblock, reset
+Agent commands:  claim, done, block, fail, show
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATES = ("inbox", "active", "blocked", "done", "failed")
+DEFAULT_CONFIG = {
+    "max_workers": 4,        # ceiling on browser workers, i.e. on terminals
+    "max_subagents": 6,      # ceiling on in-session subagents for the agent lane
+    "default_kind": "task",  # free-form label; yours to define
+    "worker_command": "claude --dangerously-skip-permissions",
+    # Kinds that always need a browser tab even without a URL in the task.
+    "browser_kinds": ["form-fill", "browse", "scrape"],
+    # Where workers start. Claude resolves skills from the working directory, so
+    # point this at a repo holding the skills a task kind needs. "" = the project.
+    # Per-kind overrides win: {"apply": "~/work/profile-repo"}.
+    "workers_start_in": "",
+    "workers_start_in_by_kind": {},
+    # Checklist file read by `fleet from-note` (default: TASKS.md / BACKLOG.md / TODO.md).
+    "checklist": "",
+    # If the checklist has a generated header, the line that ends it.
+    "checklist_user_marker": "",
+}
+
+# How a task gets executed. Only the browser lane costs a terminal.
+EXEC_MODES = ("browser", "agent", "serial")
+STALE_AFTER = 1800          # seconds in active/ before a task looks abandoned
+LANE_HELP = {
+    "browser": "own Chrome tab + own terminal (parallel, one per site)",
+    "agent":   "in-session subagent, no terminal (parallel)",
+    "serial":  "one at a time, in this session (no terminal)",
+}
+
+
+def infer_exec(url: str, kind: str, browser_kinds: list[str] | None = None) -> str:
+    """A task needs a browser tab only if it acts on a live page.
+
+    A URL is the strong signal; `browser_kinds` in .agents/config.json covers
+    kinds that need a browser even when the task is written as a sentence.
+    """
+    if kind in (browser_kinds if browser_kinds is not None else DEFAULT_CONFIG["browser_kinds"]):
+        return "browser"
+    return "browser" if url.startswith(("http://", "https://")) else "agent"
+
+
+# --------------------------------------------------------------------------- #
+# where are we
+# --------------------------------------------------------------------------- #
+
+
+def resolve_root() -> Path:
+    env = os.environ.get("AGENT_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+
+    cwd = Path.cwd().resolve()
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / ".agents").is_dir():
+            return candidate
+
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5, cwd=cwd,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return Path(out.stdout.strip())
+    except Exception:
+        pass
+
+    return cwd
+
+
+ROOT = resolve_root()
+AGENTS_DIR = ROOT / ".agents"
+QUEUE = AGENTS_DIR / "queue"
+LOGS = AGENTS_DIR / "logs"
+CONFIG_PATH = AGENTS_DIR / "config.json"
+
+
+def config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        try:
+            cfg.update(json.loads(CONFIG_PATH.read_text()))
+        except json.JSONDecodeError as exc:
+            print(f"warning: {CONFIG_PATH} is not valid JSON ({exc}); using defaults",
+                  file=sys.stderr)
+    return cfg
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def ensure_dirs() -> None:
+    """Create the queue on demand — and protect it the moment it appears.
+
+    Any command may be the first to touch a project, so the gitignore/exclude
+    rule cannot live only in `init`: a stray `fleet add` in an uninitialised repo
+    would otherwise create .agents/ with personal data and no ignore rule.
+    """
+    fresh = not AGENTS_DIR.exists()
+    for state in STATES:
+        (QUEUE / state).mkdir(parents=True, exist_ok=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
+    if fresh:
+        try:
+            hide_artifacts(ROOT, quiet=True)
+        except Exception as exc:                      # never block work on this
+            print(f"warning: could not add the ignore rule ({exc}); "
+                  f"run 'fleet doctor --fix'", file=sys.stderr)
+
+
+def task_files(state: str) -> list[Path]:
+    return sorted((QUEUE / state).glob("*.json"))
+
+
+def find_task(task_id: str) -> tuple[Path, str] | tuple[None, None]:
+    """Locate a task by id (or unique id prefix) across every state."""
+    for state in STATES:
+        for path in task_files(state):
+            if path.stem.split("-")[-1].startswith(task_id) or path.stem == task_id:
+                return path, state
+    return None, None
+
+
+def read_task(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def write_task(path: Path, task: dict) -> None:
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(task, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def log(task: dict, event: str, **fields) -> None:
+    task.setdefault("history", []).append({"at": now(), "event": event, **fields})
+
+
+def notify(title: str, body: str) -> None:
+    """Best-effort desktop notification; never fatal."""
+    try:
+        subprocess.run(
+            ["notify-send", "--app-name=agent-fleet", "--urgency=normal", title, body],
+            check=False, timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def move(path: Path, state: str) -> Path:
+    dest = QUEUE / state / path.name
+    shutil.move(str(path), str(dest))
+    return dest
+
+
+def site_of(url: str) -> str:
+    return url.split("/")[2].removeprefix("www.") if "//" in url else ""
+
+
+# --------------------------------------------------------------------------- #
+# setup
+# --------------------------------------------------------------------------- #
+
+
+ARTIFACTS = (".agents/", ".vscode/tasks.json")
+EXCLUDE_HEADER = "# --- agent-fleet: local runtime, never commit ---"
+
+
+def git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(root), *args],
+                          capture_output=True, text=True, timeout=10)
+
+
+def in_git_repo(root: Path) -> bool:
+    out = git(root, "rev-parse", "--is-inside-work-tree")
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
+def tasks_json_tracked(root: Path) -> bool:
+    return bool(git(root, "ls-files", "--", ".vscode/tasks.json").stdout.strip())
+
+
+def hide_artifacts(root: Path, quiet: bool = False) -> None:
+    """Keep fleet artifacts out of the project's GitHub.
+
+    Preferred target is .git/info/exclude: it ignores paths exactly like
+    .gitignore but is per-clone and is itself never committed, so a project's
+    tracked files are not touched at all. Only when this is not a git repo do we
+    fall back to .gitignore, so the rule is already in place if it becomes one.
+    """
+    if in_git_repo(root):
+        gitdir = git(root, "rev-parse", "--git-dir").stdout.strip()
+        exclude = (root / gitdir / "info" / "exclude").resolve()
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        current = exclude.read_text() if exclude.exists() else ""
+        # A tasks.json the project commits on purpose is its file, not ours —
+        # excluding it would be a lie (git ignores nothing already tracked).
+        wanted = [a for a in ARTIFACTS
+                  if a != ".vscode/tasks.json" or not tasks_json_tracked(root)]
+        missing = [a for a in wanted if a not in current.split()]
+        if missing:
+            with open(exclude, "a") as fh:
+                if EXCLUDE_HEADER not in current:
+                    fh.write(f"\n{EXCLUDE_HEADER}\n")
+                fh.write("".join(f"{a}\n" for a in missing))
+            if not quiet:
+                print(f"excluded {', '.join(missing)} via {exclude}  "
+                      f"(local only, never committed)")
+        elif not quiet:
+            print(f"already excluded via {exclude}")
+    else:
+        gitignore = root / ".gitignore"
+        current = gitignore.read_text() if gitignore.exists() else ""
+        missing = [a for a in ARTIFACTS if a not in current.split()]
+        if missing:
+            with open(gitignore, "a") as fh:
+                fh.write(f"\n{EXCLUDE_HEADER}\n" + "".join(f"{a}\n" for a in missing))
+            if not quiet:
+                print(f"added {', '.join(missing)} to {gitignore}  (not a git repo yet)")
+
+
+def cmd_init(args) -> int:
+    """Make the current project a fleet project."""
+    root = Path(args.path).expanduser().resolve() if args.path else Path.cwd().resolve()
+    agents_dir = root / ".agents"
+    for state in STATES:
+        (agents_dir / "queue" / state).mkdir(parents=True, exist_ok=True)
+    (agents_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+    cfg_path = agents_dir / "config.json"
+    if not cfg_path.exists():
+        cfg = dict(DEFAULT_CONFIG)
+        if args.max_workers:
+            cfg["max_workers"] = args.max_workers
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+
+    hide_artifacts(root)
+
+    print(f"fleet project ready: {agents_dir}")
+    print(f"  config:   {cfg_path}")
+    print(f"  add work: fleet add <url> --title ...")
+    print(f"  run it:   fleet run")
+    return 0
+
+
+def _expand(path: str) -> Path:
+    return Path(path).expanduser()
+
+
+def worker_cwd(kind: str | None = None) -> Path:
+    """Where a worker should start.
+
+    Claude resolves skills from the working directory, so a task kind whose
+    skills live in another repo must start there — while $AGENT_ROOT keeps the
+    worker on this project's queue. Configured, never guessed:
+
+        "workers_start_in": "~/work/toolbox",
+        "workers_start_in_by_kind": {"apply": "~/work/profile-repo"}
+    """
+    cfg = config()
+    if kind is None:
+        kinds = {t.get("kind", "") for state in ("inbox", "active")
+                 for t in (read_task(p) for p in task_files(state))}
+        for candidate, path in cfg.get("workers_start_in_by_kind", {}).items():
+            if candidate in kinds and _expand(path).is_dir():
+                return _expand(path)
+    else:
+        path = cfg.get("workers_start_in_by_kind", {}).get(kind)
+        if path and _expand(path).is_dir():
+            return _expand(path)
+    default = cfg.get("workers_start_in") or ""
+    return _expand(default) if default and _expand(default).is_dir() else ROOT
+
+
+def check_worker_cwd() -> str:
+    """Report only what the launcher cannot resolve by itself."""
+    cfg = config()
+    configured = {k: v for k, v in cfg.get("workers_start_in_by_kind", {}).items()}
+    if cfg.get("workers_start_in"):
+        configured["*"] = cfg["workers_start_in"]
+    missing = {k: v for k, v in configured.items() if not _expand(v).is_dir()}
+
+    kinds = {t.get("kind", "") for state in ("inbox", "active")
+             for t in (read_task(p) for p in task_files(state))}
+    relevant = {k: v for k, v in missing.items() if k == "*" or k in kinds}
+    if relevant:
+        listed = ", ".join(f"{k} → {v}" for k, v in relevant.items())
+        return (f"PROBLEM — workers_start_in points at a directory that does not "
+                f"exist: {listed}\n"
+                f"           fix it in {CONFIG_PATH} or drop the setting")
+    resolved = worker_cwd()
+    if resolved != ROOT:
+        return f"OK — workers will start in {resolved}, serving this queue"
+    return ""
+
+
+def cmd_doctor(args) -> int:
+    """Prove no fleet artifact can reach this project's remote, and that the
+    queued work can actually be done from here."""
+    root = ROOT
+    problems: list[str] = []
+    fixes: list[list[str]] = []
+
+    print(f"project: {root}")
+
+    if AGENTS_DIR.is_dir():
+        scope = check_worker_cwd()
+        print(f"scope:   {scope if scope else 'queued work is runnable from here ✓'}")
+        if scope.startswith("PROBLEM"):
+            problems.append("workers_start_in points at a missing directory")
+
+    if not in_git_repo(root):
+        print("git:     not a git repository — nothing can be pushed from here")
+        if problems:
+            print("\nproblems:")
+            for problem in problems:
+                print(f"  - {problem}")
+            return 1
+        return 0
+
+    remote = git(root, "remote", "-v").stdout.strip().splitlines()
+    print(f"remote:  {remote[0] if remote else '(none)'}")
+
+    # A tasks.json the project commits is the project's own file; the fleet only
+    # merges into it and restores it. It is not a fleet artifact to hide.
+    tasks_tracked = tasks_json_tracked(root)
+    ours = [a for a in ARTIFACTS if a != ".vscode/tasks.json" or not tasks_tracked]
+
+    # 1. are our artifacts ignored at all?
+    for artifact in ours:
+        path = root / artifact.rstrip("/")
+        if not path.exists():
+            print(f"ignore:  {artifact:<20} not present")
+            continue
+        ignored = git(root, "check-ignore", "-q", str(path)).returncode == 0
+        print(f"ignore:  {artifact:<20} {'ignored ✓' if ignored else 'NOT IGNORED ✗'}")
+        if not ignored:
+            problems.append(f"{artifact} is not ignored")
+
+    # 2. is anything already tracked? that is what actually reaches GitHub.
+    tracked_queue = git(root, "ls-files", "--", ".agents").stdout.split()
+    if tracked_queue:
+        print(f"tracked: {len(tracked_queue)} file(s) under .agents/ ARE tracked ✗")
+        for path in tracked_queue[:10]:
+            print(f"           {path}")
+        problems.append(f"{len(tracked_queue)} queue file(s) tracked by git")
+        fixes.append(["rm", "-r", "--cached", "--quiet", ".agents"])
+    else:
+        print("tracked: no queue file is tracked ✓")
+
+    # .vscode/tasks.json is different: plenty of projects commit their own on
+    # purpose. Untracking it would delete it from their GitHub, so never do that
+    # automatically — just say what will show up in `git status`.
+    if tasks_tracked:
+        print("tasks:   this project commits .vscode/tasks.json — the fleet merges into it,\n"
+              "           so a run shows as a local modification. 'agents clean' restores the\n"
+              "           original. To hide the edit entirely:\n"
+              "             git update-index --skip-worktree .vscode/tasks.json")
+
+    # 3. did any of it ever get committed? that needs history surgery, not a fix.
+    hist_paths = [a.rstrip("/") for a in ours]
+    hist = git(root, "log", "--oneline", "-1", "--", *hist_paths).stdout.strip()
+    if hist:
+        print(f"history: fleet artifacts appear in history — {hist}")
+        problems.append("fleet artifacts exist in committed history")
+
+    if not problems:
+        print("\nclean — nothing fleet-related can reach the remote")
+        return 0
+
+    print("\nproblems:")
+    for problem in problems:
+        print(f"  - {problem}")
+
+    if args.fix:
+        hide_artifacts(root)
+        for fix in fixes:
+            out = git(root, *fix)
+            print(f"  git {' '.join(fix)} → {'ok' if out.returncode == 0 else out.stderr.strip()}")
+        print("\nre-run 'fleet doctor' to confirm")
+    else:
+        print("\nrun 'fleet doctor --fix' to exclude and untrack them")
+
+    if hist:
+        print("\nNOTE: files already in committed history stay there until the history is\n"
+              "rewritten (git filter-repo) and force-pushed. That is destructive and\n"
+              "outward-facing — decide it deliberately, per repo.")
+    return 1
+
+
+def cmd_where(args) -> int:
+    cfg = config()
+    print(f"root:        {ROOT}")
+    print(f"queue:       {QUEUE}")
+    print(f"logs:        {LOGS}")
+    print(f"config:      {CONFIG_PATH}{'' if CONFIG_PATH.exists() else '  (defaults)'}")
+    print(f"max_workers: {cfg['max_workers']}")
+    if not AGENTS_DIR.is_dir():
+        print("\nnot initialised here yet — run: fleet init")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# checklist bridge — read tasks from the markdown file you already keep
+# --------------------------------------------------------------------------- #
+
+NOTE_NAMES = ("TASKS.md", "BACKLOG.md", "TODO.md")
+# Some checklist formats separate a generated header from the user's own region.
+# Set "checklist_user_marker" in config to that line and only the region after it
+# is read; unset (the default) reads the whole file.
+# Only a top-level "- [ ]" is a task. Indented lines under it are its sub-steps
+# and travel with it as notes — promoting them separately would shred the item.
+ITEM = re.compile(r"^-\s*\[(?P<done>[ xX])\]\s*(?P<body>.+?)\s*$")
+URL_IN = re.compile(r"https?://\S+")
+
+
+def find_note(root: Path) -> Path | None:
+    """The checklist this project keeps. `"checklist": "NOTES.md"` in
+    .agents/config.json names a different one."""
+    configured = config().get("checklist")
+    names = (configured, *NOTE_NAMES) if configured else NOTE_NAMES
+    for name in names:
+        if (root / name).is_file():
+            return root / name
+    return None
+
+
+def note_sections(text: str) -> dict[str, list[str]]:
+    """Section title → its lines, restricted to the user region when marked."""
+    marker = config().get("checklist_user_marker") or ""
+    body = text.split(marker, 1)[-1] if marker else text
+    sections: dict[str, list[str]] = {}
+    current = ""
+    for line in body.splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip()
+            sections[current] = []
+        elif current:
+            sections[current].append(line)
+    return sections
+
+
+def classify(body: str) -> dict | None:
+    """Map one note item onto a queue task. None = deliberately not ours."""
+    # Markers that mean "not for an agent": yours to decide, or hands off.
+    if "🔒" in body or body.lstrip().startswith(("?", "-x")):
+        return None
+
+    priority = 1 if "!!" in body else 2 if "!" in body else 8 if "~" in body else 5
+
+    # The note's own parallelism markers win: ⇉ parallel, ⇒ serial.
+    url_match = URL_IN.search(body)
+    if "⇒" in body:
+        mode = "serial"
+    elif url_match:
+        mode = "browser"
+    else:
+        mode = "agent"
+
+    title = re.sub(r"[`*]", "", body)
+    title = re.sub(r"^\s*[!~]+\s*", "", title)
+    title = re.sub(r"\s*[⇉⇒·]\s*", " ", title).strip()
+
+    return {
+        "url": url_match.group(0) if url_match else title,
+        "exec": mode,
+        "priority": priority,
+        "title": title[:120],
+    }
+
+
+def cmd_from_note(args) -> int:
+    """Promote note items into the queue. The note stays the source of truth."""
+    ensure_dirs()
+    note = Path(args.note).expanduser() if args.note else find_note(ROOT)
+    if note is None:
+        print(f"no checklist file in {ROOT} (looked for {', '.join(NOTE_NAMES)}); "
+              f"pass one with --note", file=sys.stderr)
+        return 1
+
+    sections = note_sections(note.read_text())
+    wanted = [args.section] if args.section else [
+        s for s in sections if any(k in s.upper() for k in ("NOW", "READY", "TODO"))]
+    if not wanted:
+        print(f"no NOW / READY / TODO section in {note.name}; "
+              f"name one with --section", file=sys.stderr)
+        return 1
+
+    # Never queue the same note line twice, whatever state it reached.
+    seen = {read_task(p).get("note_text") for state in STATES for p in task_files(state)}
+
+    added = skipped = 0
+    for title in wanted:
+        lines = sections.get(title, [])
+        for index, line in enumerate(lines):
+            match = ITEM.match(line)
+            if not match or match.group("done").lower() == "x":
+                continue
+            body = match.group("body")
+
+            # Everything indented under the item is its detail: sub-steps, why:,
+            # done-when:. The worker needs all of it.
+            detail = []
+            for follower in lines[index + 1:]:
+                if not follower.strip():
+                    break
+                if not follower[:1].isspace():
+                    break
+                detail.append(follower.strip())
+
+            if body in seen:
+                skipped += 1
+                continue
+            spec = classify(body)
+            if spec is None:
+                skipped += 1
+                continue
+
+            task_id = uuid.uuid4().hex[:8]
+            task = {
+                "id": task_id, "created": now(),
+                "url": spec["url"], "site": site_of(spec["url"]),
+                "kind": args.kind or config()["default_kind"],
+                "exec": spec["exec"], "title": spec["title"],
+                "notes": "\n".join(detail),
+                "priority": spec["priority"], "attempts": 0, "agent": None,
+                "note_file": str(note), "note_text": body,
+                "history": [{"at": now(), "event": "from-note", "section": title}],
+            }
+            name = f"p{spec['priority']}-{int(time.time())}-{task_id}.json"
+            write_task(QUEUE / "inbox" / name, task)
+            print(f"{task_id}  {spec['exec']:<7} p{spec['priority']}  {spec['title'][:70]}")
+            added += 1
+
+    print(f"\nadded {added}, skipped {skipped} (already queued, 🔒, ? or -x)")
+    if added:
+        print("plan it:  fleet plan")
+    return 0
+
+
+def cmd_to_note(args) -> int:
+    """Write finished work back: tick the item, append one LOG line. Never deletes."""
+    ensure_dirs()
+    done = [(p, read_task(p)) for p in task_files("done")]
+    pending = [(p, t) for p, t in done if t.get("note_text") and not t.get("note_synced")]
+    if not pending:
+        print("nothing to write back")
+        return 0
+
+    by_note: dict[str, list[tuple[Path, dict]]] = {}
+    for path, task in pending:
+        by_note.setdefault(task["note_file"], []).append((path, task))
+
+    for note_path, items in by_note.items():
+        note = Path(note_path)
+        if not note.is_file():
+            print(f"note gone: {note}", file=sys.stderr)
+            continue
+        lines = note.read_text().splitlines()
+        ticked, log_lines = 0, []
+
+        for path, task in items:
+            for i, line in enumerate(lines):
+                match = ITEM.match(line)
+                if match and match.group("body") == task["note_text"] \
+                        and match.group("done") == " ":
+                    lines[i] = line.replace("- [ ]", "- [x]", 1)
+                    ticked += 1
+                    break
+            log_lines.append(f"- {now()[:10]} · fleet · {task.get('title') or task['url']} "
+                             f"— {task.get('result', '')[:100]}")
+            task["note_synced"] = True
+            log(task, "written back to note")
+            write_task(path, task)
+
+        # LOG is the one section the fleet appends to, per the note's own protocol.
+        try:
+            anchor = next(i for i, l in enumerate(lines) if l.startswith("## 🧾 LOG"))
+            lines[anchor + 1:anchor + 1] = ["", *log_lines]
+        except StopIteration:
+            lines += ["", "## 🧾 LOG", "", *log_lines]
+
+        note.write_text("\n".join(lines) + "\n")
+        print(f"{note.name}: ticked {ticked}, logged {len(log_lines)}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# human commands
+# --------------------------------------------------------------------------- #
+
+
+def cmd_add(args) -> int:
+    ensure_dirs()
+    task_id = uuid.uuid4().hex[:8]
+    kind = args.kind or config()["default_kind"]
+    mode = getattr(args, "exec", "") or ("serial" if getattr(args, "serial", False)
+                                         else infer_exec(args.url, kind,
+                                                         config().get("browser_kinds")))
+    task = {
+        "id": task_id,
+        "created": now(),
+        "url": args.url,
+        "site": args.site or site_of(args.url),
+        "kind": kind,
+        "exec": mode,
+        "title": args.title or "",
+        "notes": args.note or "",
+        "priority": args.priority,
+        "attempts": 0,
+        "agent": None,
+        "history": [{"at": now(), "event": "added"}],
+    }
+    name = f"p{args.priority}-{int(time.time())}-{task_id}.json"
+    write_task(QUEUE / "inbox" / name, task)
+    print(f"{task_id}  {mode:<7} {kind}  {args.url}")
+    return 0
+
+
+def cmd_add_batch(args) -> int:
+    """Read tasks from a file or stdin: one per line, 'URL | title | note'."""
+    ensure_dirs()
+    stream = sys.stdin if args.file == "-" else open(args.file)
+    count = 0
+    with stream:
+        for line in stream:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            cmd_add(argparse.Namespace(
+                url=parts[0],
+                title=parts[1] if len(parts) > 1 else "",
+                note=parts[2] if len(parts) > 2 else "",
+                site="", kind=args.kind, priority=args.priority,
+                **{"exec": args.exec, "serial": False},
+            ))
+            count += 1
+    print(f"added {count} task(s)")
+    return 0
+
+
+def summarize(path: Path, state: str) -> str:
+    task = read_task(path)
+    flag = ""
+    if state == "blocked":
+        flag = f"  ⟵ {task.get('blocked_reason', 'needs human')}"
+    elif state == "failed":
+        flag = f"  ⟵ {task.get('failed_reason', 'failed')}"
+    elif state == "active":
+        flag = f"  ⟵ {task.get('agent', '?')}"
+    elif state == "done":
+        flag = f"  ⟵ {task.get('result', '')[:60]}"
+    return (f"  {task['id']}  p{task['priority']}  {task.get('exec', 'browser'):<7} "
+            f"{task['kind']:<10} {task.get('title') or task['url']}{flag}")
+
+
+def cmd_list(args) -> int:
+    ensure_dirs()
+    states = [args.state] if args.state else list(STATES)
+    for state in states:
+        files = task_files(state)
+        if not files and args.state is None:
+            continue
+        print(f"{state} ({len(files)})")
+        for path in files:
+            print(summarize(path, state))
+    return 0
+
+
+def cmd_status(args) -> int:
+    ensure_dirs()
+    counts = {s: len(task_files(s)) for s in STATES}
+    print("  ".join(f"{s}={counts[s]}" for s in STATES))
+    if counts["blocked"]:
+        print(f"\n{counts['blocked']} task(s) need you — run: fleet blocked")
+
+    # An agent that died leaves its task in active/ forever; say so rather than
+    # letting the queue look busy while nothing is running.
+    stale = [p for p in task_files("active")
+             if time.time() - p.stat().st_mtime > STALE_AFTER]
+    if stale:
+        print(f"\n{len(stale)} task(s) have been active for over "
+              f"{STALE_AFTER // 60} min with no update — the agent may be gone.")
+        print("  recover them with: fleet reset")
+    return 0
+
+
+def build_plan(max_workers: int | None = None) -> dict:
+    """Schedule the pending queue into lanes. Only the browser lane costs terminals."""
+    cfg = config()
+    cap = max_workers or cfg["max_workers"]
+    sub_cap = cfg["max_subagents"]
+
+    pending = [read_task(p) for p in task_files("inbox")]
+    lanes = {mode: [t for t in pending if t.get("exec", "browser") == mode]
+             for mode in EXEC_MODES}
+
+    sites = {t.get("site", "") for t in lanes["browser"]}
+    sites.discard("")
+    # One terminal per concurrent browser worker; one worker per site at most, so
+    # several agents never hammer the same host in parallel.
+    terminals = min(len(lanes["browser"]), cap, max(len(sites), 1)) if lanes["browser"] else 0
+    subagents = min(len(lanes["agent"]), sub_cap)
+
+    if lanes["browser"]:
+        if len(sites) <= min(len(lanes["browser"]), cap) and len(sites) < len(lanes["browser"]):
+            cap_reason = "one worker per site"
+        elif terminals == cap < len(lanes["browser"]):
+            cap_reason = "max_workers"
+        else:
+            cap_reason = ""
+    else:
+        cap_reason = ""
+
+    return {
+        "pending": len(pending),
+        "worker_cwd": str(worker_cwd()),
+        "kinds": sorted({t.get("kind", "") for t in pending if t.get("kind")}),
+        "terminals": terminals,
+        "subagents": subagents,
+        "sites": sorted(sites),
+        "max_workers": cap,
+        "max_subagents": sub_cap,
+        "cap_reason": cap_reason,
+        "lanes": {mode: len(tasks) for mode, tasks in lanes.items()},
+    }
+
+
+def cmd_plan(args) -> int:
+    """How to run this queue. `--count` prints only the number of terminals needed."""
+    ensure_dirs()
+    plan = build_plan(args.max)
+
+    if args.count:
+        print(plan["terminals"])
+        return 0
+    if args.json:
+        print(json.dumps(plan, indent=2))
+        return 0
+
+    if not plan["pending"]:
+        print("nothing queued — add tasks first")
+        return 0
+
+    print(f"pending: {plan['pending']} task(s)\n")
+    for mode in EXEC_MODES:
+        count = plan["lanes"][mode]
+        if not count:
+            continue
+        if mode == "browser":
+            extra = f"→ {plan['terminals']} terminal(s); sites: {', '.join(plan['sites']) or '—'}"
+        elif mode == "agent":
+            extra = f"→ {plan['subagents']} subagent(s) in parallel, no terminal"
+        else:
+            extra = "→ no terminal, run them one at a time"
+        print(f"  {mode:<8} {count:>3} task(s)   {LANE_HELP[mode]}")
+        print(f"  {'':<8} {'':>3}            {extra}")
+
+    print(f"\nterminals needed: {plan['terminals']}")
+    if plan["cap_reason"]:
+        print(f"  (browser lane capped by {plan['cap_reason']})")
+    if plan["lanes"]["agent"] or plan["lanes"]["serial"]:
+        print("  the agent and serial lanes cost nothing — run them in this session:")
+        print("    fleet claim orchestrator --exec agent")
+    return 0
+
+
+def cmd_blocked(args) -> int:
+    """What a human has to clear, grouped by reason."""
+    ensure_dirs()
+    by_reason: dict[str, list[dict]] = {}
+    for path in task_files("blocked"):
+        task = read_task(path)
+        by_reason.setdefault(task.get("blocked_reason", "unknown"), []).append(task)
+    if not by_reason:
+        print("nothing blocked")
+        return 0
+    for reason, tasks in by_reason.items():
+        print(f"\n{reason}  ({len(tasks)})")
+        for task in tasks:
+            print(f"  {task['id']}  {task.get('title') or task['url']}")
+            print(f"          {task['url']}")
+    print("\nafter clearing these:  fleet unblock --all")
+    return 0
+
+
+def cmd_unblock(args) -> int:
+    ensure_dirs()
+    if args.all:
+        targets = task_files("blocked")
+    else:
+        if not args.id:
+            print("give a task id, or --all to release every blocked task",
+                  file=sys.stderr)
+            return 2
+        path, _ = find_task(args.id)
+        if path is None:
+            print(f"no such task: {args.id}", file=sys.stderr)
+            return 1
+        targets = [path]
+    for path in targets:
+        task = read_task(path)
+        task["agent"] = None
+        task.pop("blocked_reason", None)
+        log(task, "unblocked", by="human")
+        write_task(path, task)
+        move(path, "inbox")
+        print(f"{task['id']} → inbox")
+    return 0
+
+
+def cmd_reset(args) -> int:
+    """Return stale active tasks to the inbox (e.g. after an agent died)."""
+    ensure_dirs()
+    moved = 0
+    for path in task_files("active"):
+        task = read_task(path)
+        age = time.time() - path.stat().st_mtime
+        if age < args.older_than:
+            continue
+        task["agent"] = None
+        log(task, "reset", reason=f"stale for {int(age)}s")
+        write_task(path, task)
+        move(path, "inbox")
+        print(f"{task['id']} → inbox (stale {int(age)}s)")
+        moved += 1
+    print(f"reset {moved} task(s)")
+    return 0
+
+
+def cmd_watch(args) -> int:
+    ensure_dirs()
+    try:
+        while True:
+            counts = {s: len(task_files(s)) for s in STATES}
+            line = "  ".join(f"{s}={counts[s]}" for s in STATES)
+            print(f"\r{datetime.now().strftime('%H:%M:%S')}  {line}   ", end="", flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# agent commands
+# --------------------------------------------------------------------------- #
+
+
+def cmd_claim(args) -> int:
+    """Atomically take the highest-priority task. Exit 3 when the inbox is empty.
+
+    --exec limits the claim to one lane, so a terminal worker never picks up work
+    meant for an in-session subagent (and vice versa).
+    """
+    ensure_dirs()
+    for path in task_files("inbox"):
+        if args.exec:
+            try:
+                if read_task(path).get("exec", "browser") != args.exec:
+                    continue
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+        dest = QUEUE / "active" / path.name
+        try:
+            os.rename(path, dest)          # atomic: exactly one agent wins
+        except (FileNotFoundError, OSError):
+            continue                        # lost the race, try the next task
+        task = read_task(dest)
+        task["agent"] = args.agent
+        task["attempts"] = task.get("attempts", 0) + 1
+        log(task, "claimed", agent=args.agent)
+        write_task(dest, task)
+        print(json.dumps(task, indent=2))
+        return 0
+    print(f"inbox empty{f' for lane {args.exec}' if args.exec else ''}", file=sys.stderr)
+    return 3
+
+
+def _finish(task_id: str, state: str, field: str, value: str) -> int:
+    path, _ = find_task(task_id)
+    if path is None:
+        print(f"no such task: {task_id}", file=sys.stderr)
+        return 1
+    task = read_task(path)
+    task[field] = value
+    log(task, state, **{field: value})
+    write_task(path, task)
+    move(path, state)
+    print(f"{task['id']} → {state}")
+    return 0
+
+
+def cmd_done(args) -> int:
+    return _finish(args.id, "done", "result", args.result)
+
+
+def cmd_fail(args) -> int:
+    return _finish(args.id, "failed", "failed_reason", args.reason)
+
+
+def cmd_block(args) -> int:
+    path, _ = find_task(args.id)
+    if path is None:
+        print(f"no such task: {args.id}", file=sys.stderr)
+        return 1
+    task = read_task(path)
+    notify(f"Agent blocked: {args.reason}",
+           f"{task.get('title') or task['url']}\n{task['url']}")
+    return _finish(args.id, "blocked", "blocked_reason", args.reason)
+
+
+def cmd_show(args) -> int:
+    path, state = find_task(args.id)
+    if path is None:
+        print(f"no such task: {args.id}", file=sys.stderr)
+        return 1
+    task = read_task(path)
+    task["_state"] = state
+    print(json.dumps(task, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="fleet", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="make this project a fleet project")
+    p.add_argument("path", nargs="?")
+    p.add_argument("--max-workers", type=int)
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("where", help="show which project's queue is in scope")
+    p.set_defaults(func=cmd_where)
+
+    p = sub.add_parser("from-note", help="promote checklist items into the queue")
+    p.add_argument("--note", default="",
+                   help="checklist file (default: TASKS.md / BACKLOG.md in the project)")
+    p.add_argument("--section", default="",
+                   help="only this heading (default: any NOW / READY / TODO section)")
+    p.add_argument("--kind", default="")
+    p.set_defaults(func=cmd_from_note)
+
+    p = sub.add_parser("to-note", help="tick finished items in the note and log them")
+    p.set_defaults(func=cmd_to_note)
+
+    p = sub.add_parser("doctor", help="prove no fleet artifact can reach the remote")
+    p.add_argument("--fix", action="store_true", help="exclude and untrack what it finds")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("add", help="add one task (a URL, or a sentence of work)")
+    p.add_argument("url", metavar="URL|TEXT",
+                   help="a page to act on, or the task itself in words")
+    p.add_argument("--title", default="", help="short name you will recognise later")
+    p.add_argument("--note", default="", help="instructions or context for the worker")
+    p.add_argument("--site", default="", help="override the host used for lane capping")
+    p.add_argument("--kind", default="",
+                   help="your label for the work: form-fill, research, migrate, … "
+                        "(default: default_kind from .agents/config.json)")
+    p.add_argument("--exec", default="", choices=("", *EXEC_MODES),
+                   help="browser (needs a tab+terminal), agent (subagent), serial")
+    p.add_argument("--serial", action="store_true", help="shorthand for --exec serial")
+    p.add_argument("--priority", type=int, default=5,
+                   help="1 runs first, 5 default, 9 last")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("add-batch", help="add tasks from a file or stdin ('URL | title | note')")
+    p.add_argument("file", nargs="?", default="-")
+    p.add_argument("--kind", default="")
+    p.add_argument("--exec", default="", choices=("", *EXEC_MODES))
+    p.add_argument("--priority", type=int, default=5)
+    p.set_defaults(func=cmd_add_batch)
+
+    p = sub.add_parser("plan", help="how to run this queue: lanes and terminals")
+    p.add_argument("--max", type=int)
+    p.add_argument("--count", action="store_true", help="print only the terminal count")
+    p.add_argument("--json", action="store_true", help="machine-readable plan")
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("list", help="list tasks")
+    p.add_argument("state", nargs="?", choices=STATES)
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("status", help="one-line queue counts")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("blocked", help="what needs a human, grouped by reason")
+    p.set_defaults(func=cmd_blocked)
+
+    p = sub.add_parser("unblock", help="return blocked task(s) to the inbox")
+    p.add_argument("id", nargs="?")
+    p.add_argument("--all", action="store_true")
+    p.set_defaults(func=cmd_unblock)
+
+    p = sub.add_parser("reset", help="return stale active tasks to the inbox")
+    p.add_argument("--older-than", type=int, default=STALE_AFTER, metavar="SEC")
+    p.set_defaults(func=cmd_reset)
+
+    p = sub.add_parser("watch", help="live queue counters")
+    p.add_argument("--interval", type=float, default=2.0)
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("claim", help="atomically take the next task (exit 3 = empty)")
+    p.add_argument("agent")
+    p.add_argument("--exec", default="", choices=("", *EXEC_MODES),
+                   help="claim only from this lane")
+    p.set_defaults(func=cmd_claim)
+
+    p = sub.add_parser("done", help="mark finished, with evidence")
+    p.add_argument("id")
+    p.add_argument("--result", required=True, help="what was submitted + confirmation seen")
+    p.set_defaults(func=cmd_done)
+
+    p = sub.add_parser("block", help="needs a human; notifies and frees the agent")
+    p.add_argument("id")
+    p.add_argument("--reason", required=True, help="e.g. 'login required: example.com'")
+    p.set_defaults(func=cmd_block)
+
+    p = sub.add_parser("fail", help="give up on a task")
+    p.add_argument("id")
+    p.add_argument("--reason", required=True)
+    p.set_defaults(func=cmd_fail)
+
+    p = sub.add_parser("show", help="print one task as JSON")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_show)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
