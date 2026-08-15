@@ -1,7 +1,7 @@
 # agent-fleet
 
 [![selftest](https://github.com/MSKazemi/agent-fleet/actions/workflows/selftest.yml/badge.svg)](https://github.com/MSKazemi/agent-fleet/actions/workflows/selftest.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![python3 stdlib only](https://img.shields.io/badge/deps-none-informational)](libexec/fleet-queue)
 [![docs](https://img.shields.io/badge/docs-mskazemi.com%2Fagent--fleet-E0912F)](https://mskazemi.com/agent-fleet/)
 
@@ -159,8 +159,31 @@ machine_capacity = min(
 )
 ```
 
-Memory comes from `/proc/meminfo` rather than a guess, and a container's `memory.max` is
-honoured when present. If nothing fits, capacity floors at **one worker** with a plain
+**Nothing here is a fixed assumption about your hardware.** Memory and load are read live
+from the kernel on every run; the reserves scale with the machine (≈10% of RAM, ≈1 core in
+8); and the per-worker cost is *measured* from the resident-set size of real agent sessions
+and browser tabs on that machine, then remembered in `.agents/machine.json` as a rolling
+estimate. A container's `memory.max` is honoured when present. Set any of these to a number
+in config to pin it; leave it `null` and it is worked out on the spot.
+
+```console
+$ fleet machine
+cores            20   load1 6.39
+memory           9.6 GB free of 31.0 GB
+
+reserve_mem        3173 MB   [derived from total RAM]
+reserve_cores         2      [derived from core count]
+per browser wkr     940 MB   [measured] from 13 session(s) + 39 tab(s) seen
+per subagent        550 MB   [measured]
+
+→ room for 7 browser worker(s) and 12 subagent(s), bound by memory
+  (cpu allows 10, memory allows 7)
+```
+
+Starts are staggered (`--stagger`, default 8s) so a fleet's memory ramps instead of landing
+at once, and in headless mode the machine is **re-read between each worker**: if the headroom
+is gone the run stops early with the rest of the queue intact, rather than pushing the box
+into swap. If nothing fits, capacity floors at **one worker** with a plain
 message instead of thrashing:
 
 ```console
@@ -322,7 +345,7 @@ logging to `.agents/logs/`. Either way each worker gets its own `AGENT_ID` and
 | Command | Does |
 |---|---|
 | `fleet init [--max-workers N]` | set this project up |
-| `fleet where` / `doctor [--fix]` | which queue is in scope / can anything leak |
+| `fleet where` / `machine` / `doctor [--fix]` | which queue is in scope / what the box can spare / can anything leak |
 | `fleet add URL\|TEXT [--title --note --priority --kind --exec --serial]` | queue one task |
 | `fleet add-batch [FILE\|-]` | queue many (`URL \| title \| note`) |
 | `fleet from-note` / `to-note` | checklist → queue → checklist |
@@ -338,6 +361,35 @@ logging to `.agents/logs/`. Either way each worker gets its own `AGENT_ID` and
 
 ---
 
+## Citing this work
+
+If agent-fleet helps your research, tooling or writing, a citation is the most
+useful thing you can send back.
+
+```bibtex
+@software{seyedkazemi_agent_fleet,
+  author  = {Seyedkazemi Ardebili, Mohsen},
+  title   = {agent-fleet: resource-aware parallel orchestration for coding agents},
+  year    = {2026},
+  url     = {https://github.com/MSKazemi/agent-fleet},
+  license = {Apache-2.0}
+}
+```
+
+GitHub reads [`CITATION.cff`](CITATION.cff), so the **Cite this repository**
+button in the sidebar produces BibTeX and APA for you. Archiving a release
+through [Zenodo](https://zenodo.org) mints a DOI, and adding that DOI here makes
+the citation permanent and indexable.
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Permissive: use it commercially, modify it, ship it inside your own product. Two
+conditions worth knowing, and both are why this license rather than MIT:
+
+- **Attribution travels.** Redistributions must keep the copyright notice *and*
+  the `NOTICE` file, and modified files must say they were changed (§4b–d). MIT
+  asks only for the copyright line.
+- **Patents are granted explicitly** (§3), which is what makes legal review at
+  companies straightforward — wider adoption, more visibility.

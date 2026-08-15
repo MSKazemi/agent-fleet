@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Mohsen Seyedkazemi Ardebili
+# SPDX-License-Identifier: Apache-2.0
+# Part of agent-fleet — https://github.com/MSKazemi/agent-fleet
 # fleet — run parallel Claude agents against a per-project task queue.
 #
 # One command, two halves: queue subcommands are handled by libexec/fleet-queue,
@@ -47,6 +50,7 @@ fleet — parallel Claude agents against a per-project task queue
 SETUP
   fleet init [--max-workers N]   set this project up (queue + git exclude rule)
   fleet where                    which project's queue is in scope
+  fleet machine                  what this computer can spare, and why
   fleet doctor [--fix]           prove nothing can leak, and that work is runnable
 
 QUEUE WORK
@@ -111,6 +115,17 @@ launch_headless() {
   local cmds=("$@") i pid logfile started=0 alive=0 pids=()
   mkdir -p "${ROOT}/.agents/logs"
   for i in $(seq 1 "${n}"); do
+    # Admission control: the machine is re-read between starts, because the
+    # workers already running are themselves changing the answer.
+    if [[ "${i}" -gt 1 && "${FORCE:-0}" -eq 0 ]]; then
+      local room
+      room="$(queue machine --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["capacity"])')"
+      if [[ "${room}" -lt 1 ]]; then
+        echo "  stopping at $((i - 1)) worker(s): no headroom left on this machine"
+        echo "  the remaining tasks stay queued — run fleet run again when it frees up"
+        break
+      fi
+    fi
     logfile="${ROOT}/.agents/logs/agent-${i}.log"
     setsid bash -c "cd '${cwd}' && ${cmds[$((i-1))]}" >>"${logfile}" 2>&1 &
     pid=$!
@@ -171,9 +186,10 @@ send_key() {
 write_tasks() {
   local delay="$1"; shift
   mkdir -p "${ROOT}/.vscode" "${ROOT}/.agents"
-  python3 - "${TASKS}" "${delay}" "${ROOT}/.agents/tasks.json.orig" "$@" <<'PY'
+  python3 - "${TASKS}" "${delay}" "${ROOT}/.agents/tasks.json.orig" "${STAGGER:-8}" "$@" <<'PY'
 import json, os, re, shutil, sys
-out, delay, orig, cmds = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+out, delay, orig, stagger, cmds = (sys.argv[1], sys.argv[2], sys.argv[3],
+                                   sys.argv[4], sys.argv[5:])
 
 OURS = re.compile(r"agent-\d+$")
 
@@ -210,7 +226,10 @@ if os.path.exists(out):
 tasks = []
 for i, cmd in enumerate(cmds, start=1):
     label = f"agent-{i}"
-    prefix = f"echo '[{label}] starting in {delay}s'; sleep {delay}; " if delay != "0" else ""
+    # Stagger the starts: a worker's memory arrives over a few seconds, so
+    # landing them together is what spikes a machine, not the count itself.
+    wait = int(delay) + (i - 1) * int(stagger)
+    prefix = f"echo '[{label}] starting in {wait}s'; sleep {wait}; " if wait else ""
     tasks.append({
         "label": label,
         "type": "shell",
@@ -311,6 +330,7 @@ cmd_run() {
       --max)      max="${2:?--max needs a number}"; shift 2 ;;
       --dry)      dry=1; shift ;;
       --force)    force=1; shift ;;
+      --stagger)  STAGGER="${2:?--stagger needs seconds}"; export STAGGER; shift 2 ;;
       --headless) headless=1; shift ;;
       --terminals) headless=0; shift ;;
       auto)       n=""; shift ;;
@@ -325,6 +345,7 @@ usage: fleet run [N] [--max N] [--delay S] [--headless|--terminals] [--dry]
                (no X11, no VS Code, no focus stolen). Chosen automatically when
                no usable X11 session is present.
   --force      ignore what the machine can spare (can overload it)
+  --stagger S  seconds between worker starts (default 8) so memory ramps
   --terminals  force VS Code terminals even if X11 looks unavailable
   --dry        write .vscode/tasks.json and stop
 EOF
@@ -400,7 +421,7 @@ PY
       return 0
     fi
     echo "starting ${n} headless worker(s):"
-    launch_headless "${cwd}" "${n}" "${cmds[@]}"
+    FORCE="${force}" launch_headless "${cwd}" "${n}" "${cmds[@]}"
     return
   fi
 
@@ -447,7 +468,7 @@ case "${1:-}" in
   clean)  shift; cmd_clean "$@" ;;
 
   # queue half
-  init|where|doctor|add|add-batch|from-note|to-note|plan|list|watch|blocked|\
+  init|where|machine|doctor|add|add-batch|from-note|to-note|plan|list|watch|blocked|\
   unblock|reset|claim|done|block|fail|show)
           queue "$@" ;;
 

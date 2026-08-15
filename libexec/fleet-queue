@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Mohsen Seyedkazemi Ardebili
+# SPDX-License-Identifier: Apache-2.0
+# Part of agent-fleet — https://github.com/MSKazemi/agent-fleet
 """fleet queue engine — a per-project task queue for a fleet of parallel agents.
 
 Runs in ANY project. The queue lives next to the work, not next to this script:
@@ -62,16 +65,14 @@ DEFAULT_CONFIG = {
     "checklist_user_marker": "",
 
     # --- what this machine can actually take -------------------------------
-    # A browser worker is a Claude session plus its browser tab; an agent-lane
-    # task is a subagent in an existing session. Measured in MB of RSS, rounded
-    # up deliberately: running out of memory costs more than running one fewer
-    # worker. Lower them if your machine is roomier than the defaults assume.
-    "mem_per_browser_worker_mb": 900,
-    "mem_per_agent_task_mb": 350,
-    "reserve_mem_mb": 2048,       # never plan into the last 2 GB
-    "reserve_cores": 2,           # leave the desktop responsive
-    "max_load_per_core": 0.85,    # treat the machine as full above this
-    "respect_machine": True,      # False = trust max_workers alone (not advised)
+    # null means "work it out from this machine, now" — nothing here is a fixed
+    # assumption about your hardware. Set a number to pin it instead.
+    "mem_per_browser_worker_mb": None,   # measured from real sessions, else derived
+    "mem_per_agent_task_mb": None,       # measured from real sessions, else derived
+    "reserve_mem_mb": None,              # derived: ~10% of RAM, at least 1 GB
+    "reserve_cores": None,               # derived: ~1 core per 8, at least 1
+    "max_load_per_core": 0.85,           # treat the machine as full above this
+    "respect_machine": True,             # False = trust max_workers alone
 }
 
 # How a task gets executed. Only the browser lane costs a terminal.
@@ -770,8 +771,100 @@ def _cgroup_limit_mb() -> int | None:
     return None
 
 
+def _rss_mb(pid: str) -> int | None:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _cmdline(pid: str) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").replace("\0", " ")
+    except OSError:
+        return ""
+
+
+def _p75(values: list[int]) -> int:
+    """Plan for a heavy worker, not an average one."""
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(len(ordered) * 0.75))]
+
+
+def measure_worker_cost() -> dict:
+    """What a worker actually costs *on this machine*, from live processes.
+
+    An agent session and a browser tab are separate processes, so both are
+    sampled: agent sessions by their command line, browser tabs by the renderer
+    processes a Chromium-family browser spawns per tab. Nothing is assumed about
+    your hardware — with no samples yet we fall back to a deliberately
+    conservative figure and say so.
+    """
+    agents, renderers = [], []
+    try:
+        pids = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        pids = []
+    for pid in pids:
+        mem = _rss_mb(pid)
+        if not mem:
+            continue
+        cmd = _cmdline(pid)
+        if "claude" in cmd and "--dangerously-skip-permissions" in cmd:
+            agents.append(mem)
+        elif "--type=renderer" in cmd and ("chrom" in cmd.lower() or "brave" in cmd.lower()):
+            renderers.append(mem)
+
+    FALLBACK_AGENT, FALLBACK_TAB = 500, 300
+    agent_mb = _p75(agents) if agents else FALLBACK_AGENT
+    tab_mb = _p75(renderers) if renderers else FALLBACK_TAB
+    return {
+        "agent_mb": agent_mb,
+        "tab_mb": tab_mb,
+        "browser_worker_mb": agent_mb + tab_mb,
+        "agent_samples": len(agents),
+        "tab_samples": len(renderers),
+        "source": "measured" if agents or renderers else "fallback",
+    }
+
+
+def remember_cost(sample: dict) -> dict:
+    """Blend today's measurement into what this project has seen before.
+
+    A rolling estimate rides out a moment when nothing was running, and it lives
+    beside the queue, so every machine learns its own numbers.
+    """
+    store = AGENTS_DIR / "machine.json"
+    previous = {}
+    if store.exists():
+        try:
+            previous = json.loads(store.read_text())
+        except json.JSONDecodeError:
+            previous = {}
+
+    if sample["source"] == "fallback" and previous.get("browser_worker_mb"):
+        return {**previous, "source": "remembered"}
+
+    blended = dict(sample)
+    for key in ("agent_mb", "tab_mb", "browser_worker_mb"):
+        if previous.get(key):
+            blended[key] = int(round(0.7 * previous[key] + 0.3 * sample[key]))
+    blended["updated"] = now()
+    try:
+        AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(blended, indent=2) + "\n")
+    except OSError:
+        pass
+    return blended
+
+
 def probe_machine() -> dict:
-    """What this computer can spare right now."""
+    """What this computer can spare right now. Nothing here is hard-coded to a
+    particular machine: memory and load are read live, reserves scale with the
+    hardware, and worker cost is measured from real processes."""
     cfg = config()
     cores = os.cpu_count() or 1
     try:
@@ -787,13 +880,28 @@ def probe_machine() -> dict:
         total_mb = min(total_mb or limit_mb, limit_mb)
         available_mb = min(available_mb or limit_mb, limit_mb)
 
-    # Cores not already busy, keeping a couple back for the desktop.
-    idle_cores = cores * cfg["max_load_per_core"] - load1
-    cpu_capacity = int(max(0, min(cores - cfg["reserve_cores"], idle_cores)))
+    cost = remember_cost(measure_worker_cost())
+    provenance = {}
 
-    # Memory we are willing to plan into, above the reserve.
-    spare_mb = max(0, available_mb - cfg["reserve_mem_mb"])
-    mem_capacity = int(spare_mb // cfg["mem_per_browser_worker_mb"])
+    def setting(key: str, derived: int, how: str) -> int:
+        configured = cfg.get(key)
+        provenance[key] = "configured" if configured else how
+        return int(configured) if configured else derived
+
+    # Reserves scale with the machine: a 4 GB laptop must not hold back 2 GB,
+    # and a 256 GB server should hold back more than that.
+    reserve_mem = setting("reserve_mem_mb",
+                          max(1024, int(total_mb * 0.10)) if total_mb else 1024,
+                          "derived from total RAM")
+    reserve_cores = setting("reserve_cores", max(1, cores // 8), "derived from core count")
+    per_worker = setting("mem_per_browser_worker_mb", cost["browser_worker_mb"], cost["source"])
+    per_agent = setting("mem_per_agent_task_mb", cost["agent_mb"], cost["source"])
+
+    idle_cores = cores * cfg["max_load_per_core"] - load1
+    cpu_capacity = int(max(0, min(cores - reserve_cores, idle_cores)))
+
+    spare_mb = max(0, available_mb - reserve_mem)
+    mem_capacity = int(spare_mb // max(per_worker, 1))
 
     capacity = min(cpu_capacity, mem_capacity)
     if capacity <= 0:
@@ -809,11 +917,46 @@ def probe_machine() -> dict:
         "cores": cores, "load1": round(load1, 2),
         "total_mb": total_mb, "available_mb": available_mb,
         "containerised": bool(limit_mb),
+        "reserve_mem_mb": reserve_mem, "reserve_cores": reserve_cores,
+        "mem_per_browser_worker_mb": per_worker, "mem_per_agent_task_mb": per_agent,
+        "cost_samples": {"agent": cost.get("agent_samples", 0),
+                         "tab": cost.get("tab_samples", 0)},
+        "provenance": provenance,
         "cpu_capacity": cpu_capacity, "mem_capacity": mem_capacity,
         "capacity": capacity, "bound_by": bound,
-        "subagent_capacity": max(1, int(max(0, available_mb - cfg["reserve_mem_mb"])
-                                        // cfg["mem_per_agent_task_mb"])),
+        "subagent_capacity": max(1, int(spare_mb // max(per_agent, 1))),
     }
+
+
+def cmd_machine(args) -> int:
+    """Show what was measured, what was derived, and what you pinned."""
+    ensure_dirs()
+    machine = probe_machine()
+    if args.json:
+        print(json.dumps(machine, indent=2))
+        return 0
+
+    prov = machine["provenance"]
+    print(f"cores            {machine['cores']}   load1 {machine['load1']}")
+    print(f"memory           {machine['available_mb'] / 1024:.1f} GB free "
+          f"of {machine['total_mb'] / 1024:.1f} GB"
+          f"{'   (container limit applies)' if machine['containerised'] else ''}")
+    print()
+    print(f"reserve_mem      {machine['reserve_mem_mb']:>6} MB   "
+          f"[{prov['reserve_mem_mb']}]")
+    print(f"reserve_cores    {machine['reserve_cores']:>6}      "
+          f"[{prov['reserve_cores']}]")
+    print(f"per browser wkr  {machine['mem_per_browser_worker_mb']:>6} MB   "
+          f"[{prov['mem_per_browser_worker_mb']}] "
+          f"from {machine['cost_samples']['agent']} session(s) + "
+          f"{machine['cost_samples']['tab']} tab(s) seen")
+    print(f"per subagent     {machine['mem_per_agent_task_mb']:>6} MB   "
+          f"[{prov['mem_per_agent_task_mb']}]")
+    print()
+    print(f"→ room for {machine['capacity']} browser worker(s) "
+          f"and {machine['subagent_capacity']} subagent(s), bound by {machine['bound_by']}")
+    print(f"  (cpu allows {machine['cpu_capacity']}, memory allows {machine['mem_capacity']})")
+    return 0
 
 
 def build_plan(max_workers: int | None = None, force: bool = False) -> dict:
@@ -1110,6 +1253,10 @@ def main() -> int:
     p.add_argument("path", nargs="?")
     p.add_argument("--max-workers", type=int)
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("machine", help="what this computer can spare, and where each number came from")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_machine)
 
     p = sub.add_parser("where", help="show which project's queue is in scope")
     p.set_defaults(func=cmd_where)

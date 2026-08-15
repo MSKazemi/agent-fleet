@@ -1,23 +1,34 @@
 cff-version: 1.2.0
-title: agent-fleet
-message: If you use this software, please cite it as below.
+title: "agent-fleet: resource-aware parallel orchestration for coding agents"
+message: "If you use this software, please cite it using these metadata."
 type: software
 authors:
-  - family-names: Seyedkazemi Ardebili
-    given-names: Mohsen
-    orcid: null
-    website: https://mskazemi.github.io
-repository-code: https://github.com/MSKazemi/agent-fleet
-url: https://mskazemi.com/agent-fleet/
+  - family-names: "Seyedkazemi Ardebili"
+    given-names: "Mohsen"
+    website: "https://mskazemi.github.io"
+    alias: MSKazemi
+repository-code: "https://github.com/MSKazemi/agent-fleet"
+url: "https://mskazemi.com/agent-fleet/"
 abstract: >-
-  A resource-aware orchestrator that runs many Claude Code sessions in parallel
-  against one shared task queue. Concurrency is derived from the work and from
-  what the host machine can actually spare, rather than from the queue length.
+  agent-fleet runs many coding-agent sessions in parallel against one shared,
+  file-backed task queue. Task claiming is a single atomic rename(2), so
+  concurrent workers never duplicate an item without a broker or a daemon. The
+  degree of parallelism is not taken from the queue length: it is the minimum of
+  the available work, a configured cap, one worker per remote host, and a live
+  estimate of what the executing machine can spare, derived from core count,
+  1-minute load average, MemAvailable, any cgroup memory limit, and the measured
+  resident-set size of real worker processes on that machine. Work is scheduled
+  into three lanes so that only tasks requiring a browser consume a terminal, and
+  tasks requiring human intervention are parked with a reason rather than
+  stalling the run.
 keywords:
-  - ai-agents
-  - claude-code
-  - parallel-execution
-  - task-queue
-  - resource-aware-scheduling
-  - browser-automation
-license: MIT
+  - agent orchestration
+  - parallel execution
+  - resource-aware scheduling
+  - admission control
+  - task queue
+  - large language model agents
+  - browser automation
+license: Apache-2.0
+version: 0.1.0
+date-released: "2026-08-15"

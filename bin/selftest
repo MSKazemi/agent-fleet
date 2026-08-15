@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Mohsen Seyedkazemi Ardebili
+# SPDX-License-Identifier: Apache-2.0
+# Part of agent-fleet — https://github.com/MSKazemi/agent-fleet
 # selftest — prove the fleet works, without touching a browser or a real site.
 #
 #   bin/selftest            run every check in a throwaway project
@@ -79,7 +82,7 @@ path, pairs = sys.argv[1], sys.argv[2:]
 cfg = json.load(open(path))
 for pair in pairs:
     k, _, v = pair.partition("=")
-    cfg[k] = int(v) if v.lstrip("-").isdigit() else v
+    cfg[k] = None if v == "null" else (int(v) if v.lstrip("-").isdigit() else v)
 json.dump(cfg, open(path, "w"), indent=2)
 PYCFG
 }
@@ -88,6 +91,37 @@ mach() { python3 -c 'import json,sys;print(json.loads(sys.argv[1])["machine"][sy
 
 check "the queue length never sets the worker count" "1" \
       "$([[ "$("${FLEET}" plan --count)" -lt 40 ]] && echo 1)"
+
+# nothing about the machine may be a fixed assumption
+MACH="$("${FLEET}" machine --json)"
+mval() { python3 -c 'import json,sys;print(json.loads(sys.argv[1])[sys.argv[2]])' "${MACH}" "$1"; }
+mprov() { python3 -c 'import json,sys;print(json.loads(sys.argv[1])["provenance"][sys.argv[2]])' "${MACH}" "$1"; }
+
+check "memory reserve scales with the machine, not a constant" "1" \
+      "$(python3 -c "
+import json,sys
+m = json.loads(sys.argv[1])
+want = max(1024, int(m['total_mb'] * 0.10))
+print(1 if m['reserve_mem_mb'] == want else 0)" "${MACH}")"
+check "core reserve scales with core count" "1" \
+      "$(python3 -c "
+import json,sys
+m = json.loads(sys.argv[1])
+print(1 if m['reserve_cores'] == max(1, m['cores'] // 8) else 0)" "${MACH}")"
+check "reserve is derived, not hard-coded"   "derived from total RAM" "$(mprov reserve_mem_mb)"
+check "worker cost is measured or fallback"  "1" \
+      "$([[ "$(mprov mem_per_browser_worker_mb)" =~ ^(measured|fallback|remembered)$ ]] && echo 1)"
+check "worker cost is a real number"         "1" \
+      "$([[ "$(mval mem_per_browser_worker_mb)" -gt 50 ]] && echo 1)"
+check "the estimate is remembered per project" "1" \
+      "$([[ -f "${M}/.agents/machine.json" ]] && echo 1)"
+
+# an explicit setting still wins over measurement
+setcfg mem_per_browser_worker_mb=4242
+check "a pinned cost overrides measurement" "configured" \
+      "$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["provenance"]["mem_per_browser_worker_mb"])' \
+         "$("${FLEET}" machine --json)")"
+setcfg mem_per_browser_worker_mb=null
 
 # a machine with no spare memory must fall back to serial, not refuse or overload
 setcfg max_workers=50 mem_per_browser_worker_mb=2000000 reserve_mem_mb=0

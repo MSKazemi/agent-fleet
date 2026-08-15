@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Mohsen Seyedkazemi Ardebili
+# SPDX-License-Identifier: Apache-2.0
+# Part of agent-fleet — https://github.com/MSKazemi/agent-fleet
 # install — make the fleet available in every project on this machine.
 #
 #   bin/install              symlink the command and the skills
