@@ -38,6 +38,16 @@ A task you neither report nor finish sits in `active/` until a human runs
 
 Every worker shares one browser. Tab discipline is what makes that safe.
 
+0. **Check you have a browser at all.** Chrome access is not inherited from the
+   session that started you: if no `mcp__claude-in-chrome__*` tool is available,
+   you cannot open a tab, and no amount of retrying will change that. Run
+   `fleet block <id> --reason "no browser: worker session has no chrome tools"`
+   and keep claiming — the rest of the lane is not your problem to solve. The one
+   exception: a **read-only** task that is fully satisfied by fetching the page
+   may be completed instead, and then its `--result` must **begin** with
+   `method: fetched, no browser —` so the queue never records a tab that was
+   never opened. Anything that clicks, types, logs in, or renders JavaScript is
+   blocked, not improvised.
 1. Load the `claude-in-chrome` skill before any `mcp__claude-in-chrome__*` call.
 2. Call `tabs_context_mcp` once to see the landscape.
 3. Create **your own tab** with `tabs_create_mcp` and record its id. Every

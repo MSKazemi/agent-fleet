@@ -52,6 +52,7 @@ SETUP
   fleet where                    which project's queue is in scope
   fleet machine                  what this computer can spare, and why
   fleet doctor [--fix]           prove nothing can leak, and that work is runnable
+  fleet probe-browser            ask a worker whether it can actually open a tab
 
 QUEUE WORK
   fleet add URL|TEXT [--title T] [--note N] [--priority 1-9] [--kind K]
@@ -315,6 +316,120 @@ cmd_launch() {
   trigger_tasks "${n}" "${delay}"
 }
 
+# --------------------------------------------------------------------------- #
+# is there a browser? — ask a worker, do not assume
+# --------------------------------------------------------------------------- #
+
+# The tool a worker needs before it can obey the "open your own tab" rule.
+BROWSER_TOOL="mcp__claude-in-chrome__tabs_create_mcp"
+PROBE_FILE_REL=".agents/browser-probe.json"
+
+worker_command() {
+  python3 - "${ROOT}/.agents/config.json" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1]))["worker_command"])
+except Exception:
+    print("claude --dangerously-skip-permissions")
+PY
+}
+
+# A browser lane is only as real as a worker's ability to open a tab, and that
+# access is NOT inherited from the session you type in — it belongs to whichever
+# session the Chrome extension is attached to. Same principle as `fleet machine`:
+# measure it, on this machine, now, instead of assuming it.
+cmd_probe_browser() {
+  local timeout=180 dry=0 cwd cmd out first verdict question
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout) timeout="${2:?--timeout needs seconds}"; shift 2 ;;
+      --dry)     dry=1; shift ;;
+      -h|--help) cat <<'EOF'
+usage: fleet probe-browser [--timeout S] [--dry]
+
+Starts one short-lived session exactly the way `fleet run` starts a worker, and
+asks it whether the Chrome tab tool is there. The answer is recorded in
+.agents/browser-probe.json, and `fleet doctor` and `fleet run` read it.
+
+  --timeout S   give up after S seconds (default 180)
+  --dry         print what would be asked, ask nothing, record nothing
+
+exit 0 = a worker can open a tab   1 = it cannot   2 = the probe itself failed
+EOF
+                 return 0 ;;
+      *)         die "unknown argument: $1" ;;
+    esac
+  done
+
+  [[ -d "${ROOT}/.agents" ]] || die "no fleet project here — run: fleet init"
+  cmd="$(worker_command)"
+  cwd="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["worker_cwd"])' \
+         "$(queue plan --json)")"
+  question="Answer on the first line with one word, YES or NO: is a tool named ${BROWSER_TOOL} available to you right now? Do not call any tool and do not open a browser. After the first line, name any browser tools you can see."
+
+  if [[ "${dry}" -eq 1 ]]; then
+    echo "--dry: would run in ${cwd}"
+    echo "  ${cmd} -p '<one YES/NO question about ${BROWSER_TOOL}>'"
+    echo "  and record the answer in ${ROOT}/${PROBE_FILE_REL}"
+    return 0
+  fi
+
+  echo "asking one worker-shaped session whether it has a browser (up to ${timeout}s)..."
+  out="$(cd "${cwd}" && AGENT_ROOT="${ROOT}" AGENT_ID=probe \
+         timeout "${timeout}" setsid ${cmd} -p "${question}" </dev/null 2>&1 || true)"
+  first="$(grep -oE '[A-Za-z]+' <<<"${out}" | head -1 | tr '[:lower:]' '[:upper:]')"
+
+  case "${first}" in
+    YES) verdict=true  ;;
+    NO)  verdict=false ;;
+    *)   echo "probe failed: no YES/NO came back in ${timeout}s — nothing recorded" >&2
+         [[ -n "${out}" ]] && printf '  it said: %s\n' "$(head -3 <<<"${out}")" >&2
+         return 2 ;;
+  esac
+
+  python3 - "${ROOT}/${PROBE_FILE_REL}" "${verdict}" "${cmd}" "${out}" <<'PY'
+import json, sys, time
+path, verdict, cmd, out = sys.argv[1:5]
+json.dump({
+    "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+    "browser": verdict == "true",
+    "tool": "mcp__claude-in-chrome__tabs_create_mcp",
+    "worker_command": cmd,
+    "said": "\n".join(out.strip().splitlines()[:3]),
+}, open(path, "w"), indent=2)
+PY
+
+  if [[ "${verdict}" == "true" ]]; then
+    echo "YES — a worker session can open a Chrome tab; the browser lane is real here"
+    echo "  recorded in ${PROBE_FILE_REL}"
+    return 0
+  fi
+  cat <<EOF
+NO — a worker session has no browser tools, so it cannot open a tab
+  Browser-lane tasks will come back blocked, not done: a worker that cannot see
+  ${BROWSER_TOOL} has no way to obey the tab rule.
+  Connect the Chrome extension to the worker sessions themselves, or move that
+  work to a session that already has a browser.
+  recorded in ${PROBE_FILE_REL}
+EOF
+  return 1
+}
+
+# Say it before N workers start and block one task each.
+warn_if_no_browser() {
+  python3 - "${ROOT}/${PROBE_FILE_REL}" <<'PY'
+import json, sys
+try:
+    p = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+if not p.get("browser", True):
+    print(f"WARNING: the last browser probe ({p.get('checked_at', '?')[:10]}) found no browser")
+    print("  in a worker session. These workers will block their tasks rather than")
+    print("  do them. Re-check with: fleet probe-browser")
+PY
+}
+
 # The worker prompt is embedded in a single-quoted shell string inside a JSON
 # string, so it deliberately contains no single quotes.
 worker_prompt() {
@@ -410,6 +525,8 @@ PY
     fi
   fi
 
+  warn_if_no_browser
+
   for i in $(seq 1 "${n}"); do
     cmds+=("AGENT_ROOT=${ROOT} AGENT_ID=agent-${i} exec claude --dangerously-skip-permissions '$(worker_prompt "agent-${i}")'")
   done
@@ -462,6 +579,7 @@ cmd_clean() {
 case "${1:-}" in
   # window half
   run)    shift; cmd_run "$@" ;;
+  probe-browser) shift; cmd_probe_browser "$@" ;;
   open)   shift; cmd_open "$@" ;;
   launch) shift; cmd_launch "$@" ;;
   status) shift; cmd_status "$@" ;;

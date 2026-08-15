@@ -75,7 +75,7 @@ agent-fleet is the small amount of machinery that fixes exactly those five thing
 ```bash
 git clone https://github.com/MSKazemi/agent-fleet ~/agent-fleet
 ~/agent-fleet/bin/install      # symlinks `fleet` into ~/.local/bin, the skill into ~/.claude/skills
-~/agent-fleet/bin/selftest     # 60 checks, no browser needed
+~/agent-fleet/bin/selftest     # 67 checks, no browser needed
 ```
 
 Symlinks, not copies — the clone stays the single source of truth, so an edit
@@ -210,11 +210,24 @@ tells you how to run the rest in your current session. Override with `fleet run
 
 ```bash
 fleet run              # VS Code terminals you can watch      (needs X11 + xdotool)
-fleet run --headless   # detached processes → .agents/logs/   (needs nothing)
+fleet run --headless   # detached processes → .agents/logs/   (needs no desktop)
 ```
 
 Headless is chosen automatically when X11 is unavailable, so the fleet runs over
 SSH, on Wayland, or from cron. `--terminals` forces the visible path.
+
+### Before the first browser lane, prove there is a browser
+
+```bash
+fleet probe-browser    # asks a worker-shaped session; records the answer
+```
+
+A worker does **not** inherit the Chrome connection of the session you type in.
+The probe starts one short-lived session exactly the way `fleet run` starts a
+worker and asks whether the tab tool is there, then writes the answer to
+`.agents/browser-probe.json`. `fleet doctor` reports it, and `fleet run` warns
+before starting workers that would only block their tasks. With no probe on file
+nothing is assumed — doctor says the answer is unknown and how to get it.
 
 ### Skills follow the work
 
@@ -301,6 +314,12 @@ call per repo.
 
 - **Terminals need X11 + `xdotool`.** Everything else, including running the
   fleet, works without them via `--headless`.
+- **A worker's browser is not inherited.** Chrome access belongs to the session
+  the extension is attached to, so a spawned worker may have none — measured, not
+  assumed, on the machine this was built on. The queue, the lanes, the capacity
+  model and the agent lane are unaffected; the browser lane needs
+  `fleet probe-browser` to come back YES first, and a worker that finds no tab
+  tool blocks its task instead of pretending.
 - **Terminal mode takes window focus** for a second or two per worker. Headless
   never does.
 - **Commands are never typed with `xdotool type`.** Synthetic keystrokes go to
@@ -320,7 +339,7 @@ call per repo.
 bin/fleet                 one entry point: dispatch + the launcher
 libexec/fleet-queue       the queue engine (python3, stdlib only)
 bin/install               symlinks into ~/.local/bin and ~/.claude/skills
-bin/selftest              60 headless checks
+bin/selftest              67 headless checks
 skills/agent-fleet/       the skill Claude loads (+ the worker protocol)
 ```
 
@@ -346,6 +365,7 @@ logging to `.agents/logs/`. Either way each worker gets its own `AGENT_ID` and
 |---|---|
 | `fleet init [--max-workers N]` | set this project up |
 | `fleet where` / `machine` / `doctor [--fix]` | which queue is in scope / what the box can spare / can anything leak |
+| `fleet probe-browser [--timeout S] [--dry]` | can a worker actually open a Chrome tab |
 | `fleet add URL\|TEXT [--title --note --priority --kind --exec --serial]` | queue one task |
 | `fleet add-batch [FILE\|-]` | queue many (`URL \| title \| note`) |
 | `fleet from-note` / `to-note` | checklist → queue → checklist |

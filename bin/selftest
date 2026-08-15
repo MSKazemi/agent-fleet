@@ -279,6 +279,37 @@ check "doctor detects a tracked queue"  "1" "$("${FLEET}" doctor >/dev/null 2>&1
 check "doctor --fix untracks it"        "0" "$(git ls-files -- .agents | grep -c . || true)"
 
 # --------------------------------------------------------------------------- #
+group "browser reality check"
+
+# a git repo, so doctor runs its whole path and can offer (or withhold) --fix
+B="${TMP}/browser"; mkdir -p "${B}"; cd "${B}"; git init -q .
+"${FLEET}" init >/dev/null
+"${FLEET}" add "https://tab.example/1" --title needs-a-tab >/dev/null
+check "no probe means unknown, never assumed" "1" \
+      "$("${FLEET}" doctor 2>/dev/null | grep -c 'is unknown')"
+check "probing never happens by accident"     "0" \
+      "$([[ -f .agents/browser-probe.json ]] && echo 1 || echo 0)"
+check "--dry names the worker command, asks nothing" "1" \
+      "$("${FLEET}" probe-browser --dry | grep -c 'claude --dangerously-skip-permissions')"
+
+probe() { python3 - "${B}/.agents/browser-probe.json" "$1" <<'PYPROBE'
+import json, sys
+json.dump({"checked_at": "2026-01-01T00:00:00+00:00", "browser": sys.argv[2] == "yes"},
+          open(sys.argv[1], "w"))
+PYPROBE
+}
+probe no
+check "a browserless worker is a doctor problem" "1" \
+      "$("${FLEET}" doctor >/dev/null 2>&1; echo $?)"
+check "and --fix is not offered for it"          "0" \
+      "$("${FLEET}" doctor 2>/dev/null | grep -c 'doctor --fix')"
+check "run warns before starting doomed workers" "1" \
+      "$("${FLEET}" run --headless --dry 2>&1 | grep -c 'found no browser')"
+probe yes
+check "a working browser clears the problem"     "0" \
+      "$("${FLEET}" doctor >/dev/null 2>&1; echo $?)"
+
+# --------------------------------------------------------------------------- #
 group "checklist bridge"
 
 N="${TMP}/checklist"; mkdir -p "${N}"; cd "${N}"; "${FLEET}" init >/dev/null

@@ -350,6 +350,55 @@ def check_worker_cwd() -> str:
     return ""
 
 
+BROWSER_PROBE = AGENTS_DIR / "browser-probe.json"
+
+
+def read_browser_probe() -> dict | None:
+    """The last recorded answer to 'can a worker actually open a tab?'.
+
+    Written by `fleet probe-browser`. Nothing here guesses: with no probe on
+    file the answer is unknown, and doctor says so rather than assuming yes.
+    """
+    try:
+        return json.loads(BROWSER_PROBE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def pending_browser_tasks() -> int:
+    return sum(1 for state in ("inbox", "active")
+               for t in (read_task(p) for p in task_files(state))
+               if t.get("exec", "browser") == "browser")
+
+
+def check_browser() -> tuple[list[str], str]:
+    """(lines, problem) — whether the browser lane can actually run from here.
+
+    A worker's Chrome access is not inherited from the session you type in, so
+    'the queue is fine' and 'this work is runnable' are two different questions.
+    """
+    waiting = pending_browser_tasks()
+    probe = read_browser_probe()
+
+    if probe is None:
+        if not waiting:
+            return [], ""
+        return ([f"{waiting} task(s) need a Chrome tab, and whether a worker has one",
+                 "         is unknown — a worker does not inherit this session's browser.",
+                 "         Measure it: fleet probe-browser"], "")
+
+    when = str(probe.get("checked_at", "?"))[:10]
+    if probe.get("browser"):
+        return [f"a worker could open a tab ✓  (probed {when})"], ""
+
+    lines = [f"a worker could NOT open a tab ✗  (probed {when})"]
+    if waiting:
+        lines.append(f"         {waiting} browser task(s) would come back blocked, not done")
+        return lines, "workers have no browser, and browser tasks are queued"
+    lines.append("         nothing browser-shaped is queued, so nothing is stuck on it")
+    return lines, ""
+
+
 def cmd_doctor(args) -> int:
     """Prove no fleet artifact can reach this project's remote, and that the
     queued work can actually be done from here."""
@@ -364,6 +413,12 @@ def cmd_doctor(args) -> int:
         print(f"scope:   {scope if scope else 'queued work is runnable from here ✓'}")
         if scope.startswith("PROBLEM"):
             problems.append("workers_start_in points at a missing directory")
+
+        browser_lines, browser_problem = check_browser()
+        if browser_lines:
+            print("browser: " + "\n".join(browser_lines))
+        if browser_problem:
+            problems.append(browser_problem)
 
     if not in_git_repo(root):
         print("git:     not a git repository — nothing can be pushed from here")
@@ -428,13 +483,16 @@ def cmd_doctor(args) -> int:
     for problem in problems:
         print(f"  - {problem}")
 
+    # --fix is about git hygiene only. A missing browser is not a git problem and
+    # saying "run --fix" would be a lie about what that flag can do.
+    git_problems = [p for p in problems if "browser" not in p]
     if args.fix:
         hide_artifacts(root)
         for fix in fixes:
             out = git(root, *fix)
             print(f"  git {' '.join(fix)} → {'ok' if out.returncode == 0 else out.stderr.strip()}")
         print("\nre-run 'fleet doctor' to confirm")
-    else:
+    elif git_problems:
         print("\nrun 'fleet doctor --fix' to exclude and untrack them")
 
     if hist:

@@ -21,7 +21,14 @@ the judgement the help text cannot.
 cd ~/any/project && fleet init     # queue + git exclude rule
 fleet where                        # which project's queue is in scope
 fleet doctor                       # can anything leak; is the work runnable
+fleet probe-browser                # can a worker actually open a Chrome tab
 ```
+
+Run `probe-browser` once per machine before the first browser lane. A worker does
+**not** inherit the Chrome connection of the session you type in, and a worker
+without it blocks every browser task instead of doing it. `fleet doctor` reports
+the last probe; with no probe on file it says the answer is unknown rather than
+assuming one.
 
 The queue resolves from **where you are**: `$AGENT_ROOT`, else the nearest
 ancestor holding `.agents/`, else the git root, else `$PWD`. Every project keeps
@@ -139,5 +146,5 @@ by VS Code tasks or as detached processes.
 
 `python3` for everything; X11 + `xdotool` only for the terminal path (focus is
 taken briefly), `notify-send` for blocked alerts. `fleet doctor` and `bin/selftest`
-(60 checks, no browser needed) report what is missing instead of failing
+(67 checks, no browser needed) report what is missing instead of failing
 obscurely — run the self-test after changing the tool.

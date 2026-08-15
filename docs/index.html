@@ -300,7 +300,7 @@ footer a { color: var(--ink-soft); }
       <span class="badge">Apache-2.0</span>
       <span class="badge">python3 stdlib only</span>
       <span class="badge">no daemon · no broker</span>
-      <span class="badge">60 self-tests</span>
+      <span class="badge">67 self-tests</span>
       <span class="badge">linux · x11 optional</span>
     </div>
   </div>
@@ -595,6 +595,9 @@ terminals needed: <span class="p">4</span>
         system actually returned; anything irreversible is screenshotted first.</li>
       <li><b>It will not stall on a login page.</b> A wall parks that task with a reason and a desktop
         notification while the worker takes the next one.</li>
+      <li><b>It will not pretend it has a browser.</b> A worker does not inherit the Chrome connection of
+        the session you type in, so <code>fleet probe-browser</code> asks a real worker whether it can open
+        a tab and records the answer. A worker that finds none blocks its task instead of improvising.</li>
       <li><b>It will not touch your repository.</b> Runtime state is excluded through
         <code>.git/info/exclude</code>, so your tracked files — including <code>.gitignore</code> — stay
         exactly as they were.</li>
@@ -612,7 +615,7 @@ terminals needed: <span class="p">4</span>
 <pre><span class="c"># python3 stdlib only — nothing to pip install</span>
 git clone https://github.com/MSKazemi/agent-fleet ~/agent-fleet
 ~/agent-fleet/bin/install
-~/agent-fleet/bin/selftest        <span class="c"># 60 checks, no browser needed</span>
+~/agent-fleet/bin/selftest        <span class="c"># 67 checks, no browser needed</span>
 
 cd ~/any/project
 fleet <span class="p">init</span>
