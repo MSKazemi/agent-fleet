@@ -75,7 +75,7 @@ agent-fleet is the small amount of machinery that fixes exactly those five thing
 ```bash
 git clone https://github.com/MSKazemi/agent-fleet ~/agent-fleet
 ~/agent-fleet/bin/install      # symlinks `fleet` into ~/.local/bin, the skill into ~/.claude/skills
-~/agent-fleet/bin/selftest     # 67 checks, no browser needed
+~/agent-fleet/bin/selftest     # 70 checks, no browser needed
 ```
 
 Symlinks, not copies — the clone stays the single source of truth, so an edit
@@ -314,12 +314,15 @@ call per repo.
 
 - **Terminals need X11 + `xdotool`.** Everything else, including running the
   fleet, works without them via `--headless`.
-- **A worker's browser is not inherited.** Chrome access belongs to the session
-  the extension is attached to, so a spawned worker may have none — measured, not
-  assumed, on the machine this was built on. The queue, the lanes, the capacity
-  model and the agent lane are unaffected; the browser lane needs
-  `fleet probe-browser` to come back YES first, and a worker that finds no tab
-  tool blocks its task instead of pretending.
+- **The browser lane needs terminals, not headless.** A terminal worker is
+  `claude` run interactively: it is offered the Chrome toolset and gets its own
+  per-session tab group, and two sessions can hold live connections to the *same*
+  Chrome at once, each seeing only its own tabs — measured on 2026-08-16, not
+  assumed. So N terminals really do give N parallel tabs. Print mode (`-p`) is
+  the exception and has no browser at all, which is what `fleet probe-browser`
+  measures; a NO from it is recorded as `"mode": "print"` and applies to
+  `--headless`, not to `fleet run --terminals`. A worker that finds no tab tool
+  still blocks its task instead of pretending.
 - **Terminal mode takes window focus** for a second or two per worker. Headless
   never does.
 - **Commands are never typed with `xdotool type`.** Synthetic keystrokes go to
@@ -339,7 +342,7 @@ call per repo.
 bin/fleet                 one entry point: dispatch + the launcher
 libexec/fleet-queue       the queue engine (python3, stdlib only)
 bin/install               symlinks into ~/.local/bin and ~/.claude/skills
-bin/selftest              67 headless checks
+bin/selftest              70 headless checks
 skills/agent-fleet/       the skill Claude loads (+ the worker protocol)
 ```
 

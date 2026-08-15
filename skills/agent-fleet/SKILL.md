@@ -146,5 +146,5 @@ by VS Code tasks or as detached processes.
 
 `python3` for everything; X11 + `xdotool` only for the terminal path (focus is
 taken briefly), `notify-send` for blocked alerts. `fleet doctor` and `bin/selftest`
-(67 checks, no browser needed) report what is missing instead of failing
+(70 checks, no browser needed) report what is missing instead of failing
 obscurely — run the self-test after changing the tool.

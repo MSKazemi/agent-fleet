@@ -395,6 +395,14 @@ json.dump({
     "browser": verdict == "true",
     "tool": "mcp__claude-in-chrome__tabs_create_mcp",
     "worker_command": cmd,
+    # The probe asks with -p, so it measures PRINT mode. A terminal worker is
+    # the same binary run interactively, and that is a different answer: an
+    # interactive session is offered the Chrome toolset and gets its own
+    # per-session tab group, measured on 2026-08-16 with two sessions holding
+    # live connections to one Chrome at once. Recording the mode keeps a NO
+    # here from being read as a verdict on `fleet run --terminals`.
+    "mode": "print",
+    "applies_to": "print/headless workers; terminal workers are not covered",
     "said": "\n".join(out.strip().splitlines()[:3]),
 }, open(path, "w"), indent=2)
 PY
@@ -405,28 +413,48 @@ PY
     return 0
   fi
   cat <<EOF
-NO — a worker session has no browser tools, so it cannot open a tab
-  Browser-lane tasks will come back blocked, not done: a worker that cannot see
-  ${BROWSER_TOOL} has no way to obey the tab rule.
-  Connect the Chrome extension to the worker sessions themselves, or move that
-  work to a session that already has a browser.
+NO — a PRINT-mode session has no browser tools, so it cannot open a tab
+  This probe asks with -p. It is the right answer for 'fleet run --headless',
+  where browser-lane tasks will come back blocked rather than done.
+  It is NOT a verdict on 'fleet run --terminals': a terminal worker is the same
+  binary run interactively, it is offered the Chrome toolset, and it gets its
+  own per-session tab group. Two sessions can hold live connections to one
+  Chrome at the same time — measured, not assumed.
+  So: use terminals for browser work, or move it to a session that has a tab.
   recorded in ${PROBE_FILE_REL}
 EOF
   return 1
 }
 
 # Say it before N workers start and block one task each.
+#
+# Scoped to the mode being started. The probe asks with -p, so a NO is evidence
+# about print/headless workers only; terminal workers run the same binary
+# interactively, are offered the Chrome toolset, and each get their own tab
+# group. Warning on a terminal run would talk people out of the one arrangement
+# that works.
 warn_if_no_browser() {
-  python3 - "${ROOT}/${PROBE_FILE_REL}" <<'PY'
+  local headless="${1:-1}"
+  python3 - "${ROOT}/${PROBE_FILE_REL}" "${headless}" <<'PY'
 import json, sys
 try:
     p = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(0)
-if not p.get("browser", True):
-    print(f"WARNING: the last browser probe ({p.get('checked_at', '?')[:10]}) found no browser")
-    print("  in a worker session. These workers will block their tasks rather than")
-    print("  do them. Re-check with: fleet probe-browser")
+headless = sys.argv[2] == "1"
+if p.get("browser", True):
+    sys.exit(0)
+when = str(p.get("checked_at", "?"))[:10]
+if p.get("mode", "print") != "print":
+    print(f"WARNING: the last browser probe ({when}) found no browser in a worker.")
+    print("  These workers will block their tasks rather than do them.")
+elif headless:
+    print(f"WARNING: the last browser probe ({when}) found no browser in a print-mode")
+    print("  session, and this is a headless run — the closest thing to it. Browser")
+    print("  tasks will likely come back blocked. Prefer: fleet run --terminals")
+else:
+    print(f"note: the browser probe ({when}) said no, but it measures -p (print mode).")
+    print("  This is a terminal run, where each worker gets its own Chrome tab group.")
 PY
 }
 
@@ -525,7 +553,7 @@ PY
     fi
   fi
 
-  warn_if_no_browser
+  warn_if_no_browser "${headless}"
 
   for i in $(seq 1 "${n}"); do
     cmds+=("AGENT_ROOT=${ROOT} AGENT_ID=agent-${i} exec claude --dangerously-skip-permissions '$(worker_prompt "agent-${i}")'")

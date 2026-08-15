@@ -292,19 +292,35 @@ check "probing never happens by accident"     "0" \
 check "--dry names the worker command, asks nothing" "1" \
       "$("${FLEET}" probe-browser --dry | grep -c 'claude --dangerously-skip-permissions')"
 
-probe() { python3 - "${B}/.agents/browser-probe.json" "$1" <<'PYPROBE'
+probe() { python3 - "${B}/.agents/browser-probe.json" "$1" "${2:-print}" <<'PYPROBE'
 import json, sys
-json.dump({"checked_at": "2026-01-01T00:00:00+00:00", "browser": sys.argv[2] == "yes"},
+json.dump({"checked_at": "2026-01-01T00:00:00+00:00",
+           "browser": sys.argv[2] == "yes", "mode": sys.argv[3]},
           open(sys.argv[1], "w"))
 PYPROBE
 }
-probe no
+
+# The default probe asks with -p, so it measures PRINT mode. A terminal worker is
+# the same binary run interactively: it is offered the Chrome toolset and gets its
+# own per-session tab group, and two sessions can hold live connections to one
+# Chrome at once. Reporting a print-mode NO as "the browser lane is broken" talks
+# people out of the one arrangement that works, so the verdict is scoped by mode.
+probe no print
+check "a print-mode NO is not a verdict on terminals" "0" \
+      "$("${FLEET}" doctor >/dev/null 2>&1; echo $?)"
+check "doctor says what the NO does not cover"   "1" \
+      "$("${FLEET}" doctor 2>/dev/null | grep -c 'terminal workers are not')"
+check "a headless run is still warned"           "1" \
+      "$("${FLEET}" run --headless --dry 2>&1 | grep -c 'found no browser')"
+
+probe no terminal
 check "a browserless worker is a doctor problem" "1" \
       "$("${FLEET}" doctor >/dev/null 2>&1; echo $?)"
 check "and --fix is not offered for it"          "0" \
       "$("${FLEET}" doctor 2>/dev/null | grep -c 'doctor --fix')"
 check "run warns before starting doomed workers" "1" \
       "$("${FLEET}" run --headless --dry 2>&1 | grep -c 'found no browser')"
+
 probe yes
 check "a working browser clears the problem"     "0" \
       "$("${FLEET}" doctor >/dev/null 2>&1; echo $?)"

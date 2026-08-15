@@ -276,8 +276,15 @@ def hide_artifacts(root: Path, quiet: bool = False) -> None:
 
 
 def cmd_init(args) -> int:
-    """Make the current project a fleet project."""
-    root = Path(args.path).expanduser().resolve() if args.path else Path.cwd().resolve()
+    """Make the current project a fleet project.
+
+    Falls back to ROOT, not Path.cwd(): every other command resolves its project
+    through resolve_root(), so an init that read only the cwd made `AGENT_ROOT=/x
+    fleet init` silently set up whatever directory you happened to be standing
+    in — and then `fleet add` in the same shell wrote somewhere else entirely.
+    An explicit path argument still wins over both.
+    """
+    root = Path(args.path).expanduser().resolve() if args.path else ROOT.resolve()
     agents_dir = root / ".agents"
     for state in STATES:
         (agents_dir / "queue" / state).mkdir(parents=True, exist_ok=True)
@@ -390,6 +397,18 @@ def check_browser() -> tuple[list[str], str]:
     when = str(probe.get("checked_at", "?"))[:10]
     if probe.get("browser"):
         return [f"a worker could open a tab ✓  (probed {when})"], ""
+
+    # A NO from the default probe is about PRINT mode (it asks with -p). Terminal
+    # workers run the same binary interactively, are offered the Chrome toolset,
+    # and each get their own per-session tab group — so a print-mode NO must not
+    # be reported as "the browser lane is broken here".
+    if probe.get("mode", "print") == "print":
+        lines = [f"a print-mode session could NOT open a tab ✗  (probed {when})",
+                 "         that is the answer for --headless; terminal workers are not",
+                 "         covered by it and each get their own Chrome tab group"]
+        if waiting:
+            lines.append(f"         run the {waiting} queued browser task(s) with: fleet run --terminals")
+        return lines, ""
 
     lines = [f"a worker could NOT open a tab ✗  (probed {when})"]
     if waiting:
