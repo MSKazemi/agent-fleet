@@ -75,7 +75,7 @@ agent-fleet is the small amount of machinery that fixes exactly those five thing
 ```bash
 git clone https://github.com/MSKazemi/agent-fleet ~/agent-fleet
 ~/agent-fleet/bin/install      # symlinks `fleet` into ~/.local/bin, the skill into ~/.claude/skills
-~/agent-fleet/bin/selftest     # 70 checks, no browser needed
+~/agent-fleet/bin/selftest     # 79 checks, no browser needed
 ```
 
 Symlinks, not copies — the clone stays the single source of truth, so an edit
@@ -129,6 +129,27 @@ serial, `!!`/`!` higher priority, `~` lower. `?`, `🔒`, `-x` and ticked items 
 **never** queued — a `?` is a human decision, not an agent's. Indented sub-steps
 travel with their parent item. Re-running never duplicates, and `to-note` only
 ticks tasks that finished with evidence.
+
+**If you keep no checklist,** `fleet init` writes a starter `TASKS.md` with the
+format documented inline. It is created only when the project has none —
+an existing `TASKS.md`, `BACKLOG.md`, `TODO.md`, or a file named by `"checklist"`
+is left byte-for-byte alone, and `fleet init --no-checklist` skips it entirely.
+The file is yours: unlike `.agents/`, it is deliberately **not** excluded from
+git, so you can commit your backlog or ignore it as you prefer.
+
+Two config keys tune the bridge:
+
+```jsonc
+"checklist": "NOTES.md",                    // read this file instead
+"checklist_user_marker": "<!-- mine -->"    // ignore everything above this line
+```
+
+`checklist_user_marker` matters when your checklist has a generated header: only
+the region *below* that line is read, so instructions in the header cannot be
+mistaken for tasks.
+
+Because re-running is deduplicated on the exact line text, `fleet from-note` is
+safe to run **while workers are still going** — it queues only what you added.
 
 ---
 
@@ -342,7 +363,7 @@ call per repo.
 bin/fleet                 one entry point: dispatch + the launcher
 libexec/fleet-queue       the queue engine (python3, stdlib only)
 bin/install               symlinks into ~/.local/bin and ~/.claude/skills
-bin/selftest              70 headless checks
+bin/selftest              79 headless checks
 skills/agent-fleet/       the skill Claude loads (+ the worker protocol)
 ```
 

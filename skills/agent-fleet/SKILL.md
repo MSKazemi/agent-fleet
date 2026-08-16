@@ -50,12 +50,27 @@ and the config can route it. `--priority 1` runs first, `5` is the default.
 
 **From a checklist.** `fleet from-note` reads the markdown checklist the project
 already keeps (`TASKS.md`, `BACKLOG.md`, `TODO.md`, or `"checklist"` in
-`.agents/config.json`), taking unchecked items from any NOW / READY / TODO
+`.agents/config.json`; `"checklist_user_marker"` names a line below which
+reading starts, for files with a generated header). If the project keeps none,
+`fleet init` leaves a starter `TASKS.md` documenting the format — never
+overwriting one that exists, and skipped with `--no-checklist`. It takes
+unchecked items from any NOW / READY / TODO
 section. Markers carry over: `⇉` parallel, `⇒` serial, `!!`/`!` raise priority,
 `~` lowers it. `?`, `🔒`, `-x` and ticked items are never queued — a `?` is a
 decision for the human, not an agent. Sub-steps indented under an item travel
 with it as `notes`. `fleet to-note` ticks what finished with evidence and appends
 one `## LOG` line; it never deletes or reorders anything a human wrote.
+
+**Groom before you promote.** `from-note` is regex — it routes on the symbols
+already in the line and understands nothing. So when the checklist has an INBOX
+section of raw notes, do the reading pass yourself before running it: for each
+raw line decide what it actually is, rewrite it as one task with a `why:`, the
+sub-steps the human did not think to ask for, and a `done-when:` naming a
+runnable check; mark `⇒` when it must not run beside its neighbours, and `?`
+when any part of it is genuinely the human's call. Move the result into READY
+and leave INBOX empty. Never bounce an idea back untouched, and never promote
+raw INBOX text — a one-line task with no `done-when` gives the worker nothing to
+prove itself against.
 
 ## Three lanes — only one costs a terminal
 
@@ -146,5 +161,5 @@ by VS Code tasks or as detached processes.
 
 `python3` for everything; X11 + `xdotool` only for the terminal path (focus is
 taken briefly), `notify-send` for blocked alerts. `fleet doctor` and `bin/selftest`
-(70 checks, no browser needed) report what is missing instead of failing
+(79 checks, no browser needed) report what is missing instead of failing
 obscurely — run the self-test after changing the tool.

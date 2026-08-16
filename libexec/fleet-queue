@@ -193,7 +193,14 @@ def log(task: dict, event: str, **fields) -> None:
 
 
 def notify(title: str, body: str) -> None:
-    """Best-effort desktop notification; never fatal."""
+    """Best-effort desktop notification; never fatal.
+
+    FLEET_NO_NOTIFY silences it. A blocked task is worth interrupting a human
+    for, which is exactly why the test suite and CI must not raise one: a run
+    that cries wolf teaches you to ignore the alert that matters.
+    """
+    if os.environ.get("FLEET_NO_NOTIFY"):
+        return
     try:
         subprocess.run(
             ["notify-send", "--app-name=agent-fleet", "--urgency=normal", title, body],
@@ -299,8 +306,25 @@ def cmd_init(args) -> int:
 
     hide_artifacts(root)
 
+    # A checklist the project already keeps always wins — including one named by
+    # "checklist" in a config that survived an earlier init. Only a project with
+    # no checklist at all gets the starter file, and it is never overwritten:
+    # a stranger's TODO.md is their work, not ours to reformat.
+    checklist_note = ""
+    if not args.no_checklist:
+        cfg_now = json.loads(cfg_path.read_text())
+        candidates = [n for n in (cfg_now.get("checklist"), *NOTE_NAMES) if n]
+        found = next((n for n in candidates if (root / n).is_file()), None)
+        if found:
+            checklist_note = f"  checklist: {found} (yours — left untouched)"
+        else:
+            (root / NOTE_NAMES[0]).write_text(CHECKLIST_TEMPLATE)
+            checklist_note = f"  checklist: {NOTE_NAMES[0]} (created — write tasks there)"
+
     print(f"fleet project ready: {agents_dir}")
     print(f"  config:   {cfg_path}")
+    if checklist_note:
+        print(checklist_note)
     print(f"  add work: fleet add <url> --title ...")
     print(f"  run it:   fleet run")
     return 0
@@ -538,6 +562,49 @@ def cmd_where(args) -> int:
 # --------------------------------------------------------------------------- #
 
 NOTE_NAMES = ("TASKS.md", "BACKLOG.md", "TODO.md")
+
+# Written by `fleet init` only when the project has no checklist at all. The
+# example items are INDENTED on purpose: only a top-level "- [ ]" is a task, so
+# a fresh project starts with an empty queue instead of six phantom ones.
+CHECKLIST_TEMPLATE = """\
+# Tasks
+
+Your checklist and the fleet's queue, in one file.
+`fleet from-note` promotes items into the queue; `fleet to-note` ticks them back.
+
+## INBOX
+
+<!-- Dump raw ideas here — any format, any language, half a sentence is fine.
+     from-note IGNORES this section on purpose: an idea nobody has thought
+     through yet should not become a task. Move it to READY when it is real. -->
+
+## READY
+
+<!-- from-note reads ONLY this section (or any heading naming NOW or TODO).
+
+     One task per top-level "- [ ]". Lines indented beneath it travel with it
+     as notes, so a task carries its own why / steps / done-when.
+
+     Markers:
+       !    raise priority          !!  do this first
+       ~    lower priority          ⇒   run serially, never in parallel
+       a URL in the line   → browser lane, at most one worker per host
+       ? at the line start → your decision to make; never queued
+       🔒                  → never touched
+
+     Ticked items, and anything already queued, are skipped — so re-running
+     from-note only adds what is new. That makes it safe to edit this file
+     while workers are running.
+
+     Examples (indented, so they are notes rather than tasks):
+       - [ ] check https://example.com/pricing still lists the free tier
+       - [ ] ⇒ migrate the config parser, then run the suite
+         why: three other tasks are waiting on the rewrite
+         done-when: ./run-tests exits 0
+-->
+
+## 🧾 LOG
+"""
 # Some checklist formats separate a generated header from the user's own region.
 # Set "checklist_user_marker" in config to that line and only the region after it
 # is read; unset (the default) reads the whole file.
@@ -1329,6 +1396,8 @@ def main() -> int:
     p = sub.add_parser("init", help="make this project a fleet project")
     p.add_argument("path", nargs="?")
     p.add_argument("--max-workers", type=int)
+    p.add_argument("--no-checklist", action="store_true",
+                   help="do not create a starter TASKS.md")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("machine", help="what this computer can spare, and where each number came from")
@@ -1338,9 +1407,15 @@ def main() -> int:
     p = sub.add_parser("where", help="show which project's queue is in scope")
     p.set_defaults(func=cmd_where)
 
-    p = sub.add_parser("from-note", help="promote checklist items into the queue")
+    p = sub.add_parser(
+        "from-note", help="promote checklist items into the queue",
+        epilog="Config: \"checklist\" names a different file; "
+               "\"checklist_user_marker\" is a line whose text ends a generated "
+               "header, so only the region below it is read. Items are top-level "
+               "'- [ ]' lines; indented lines below one travel with it as notes.")
     p.add_argument("--note", default="",
-                   help="checklist file (default: TASKS.md / BACKLOG.md in the project)")
+                   help="checklist file (default: TASKS.md / BACKLOG.md / TODO.md, "
+                        "or \"checklist\" in .agents/config.json)")
     p.add_argument("--section", default="",
                    help="only this heading (default: any NOW / READY / TODO section)")
     p.add_argument("--kind", default="")

@@ -21,6 +21,11 @@ PASS=0 FAIL=0 SKIP=0
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fleet-selftest.XXXXXX")"
 trap 'rm -rf "${TMP}"' EXIT
 
+# The suite blocks tasks on purpose, and blocking raises a desktop notification.
+# Running the tests must never put a fake "an agent needs your login" alert on
+# a human's screen — the alert is only useful while it is always real.
+export FLEET_NO_NOTIFY=1
+
 ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; [[ -n "${2:-}" ]] && printf '      %s\n' "$2"; }
 skip() { SKIP=$((SKIP+1)); printf '  \033[33m-\033[0m %s (skipped: %s)\n' "$1" "$2"; }
@@ -222,6 +227,30 @@ check "block parks the task"       "1" "$("${FLEET}" list blocked | grep -c "${I
 "${FLEET}" unblock --all >/dev/null
 check "unblock returns it"         "1" "$("${FLEET}" plan --count)"
 check "unblock with no id refuses" "2" "$("${FLEET}" unblock >/dev/null 2>&1; echo $?)"
+# -- the notification a blocked task raises ---------------------------------
+
+# Prove the suppression rather than trusting it: a stub notify-send on PATH
+# records every call, so both directions are observable.
+FAKEBIN="${TMP}/fakebin"; mkdir -p "${FAKEBIN}"
+NOTIFY_LOG="${TMP}/notify.log"; : > "${NOTIFY_LOG}"
+# Args are: --app-name=... --urgency=... TITLE BODY, so the title is \$3. Log
+# the title only: the body is deliberately two lines, and counting lines instead
+# of calls would silently turn one alert into two.
+cat > "${FAKEBIN}/notify-send" <<EOS
+#!/usr/bin/env bash
+printf 'CALL %s\n' "\$3" >> "${NOTIFY_LOG}"
+EOS
+chmod +x "${FAKEBIN}/notify-send"
+NID="$("${FLEET}" claim solo | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+PATH="${FAKEBIN}:${PATH}" "${FLEET}" block "${NID}" --reason "quiet" >/dev/null
+check "FLEET_NO_NOTIFY silences the alert" "0" "$(wc -l < "${NOTIFY_LOG}")"
+"${FLEET}" unblock --all >/dev/null
+NID="$("${FLEET}" claim solo | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+PATH="${FAKEBIN}:${PATH}" env -u FLEET_NO_NOTIFY "${FLEET}" block "${NID}" --reason "loud" >/dev/null
+check "without it, blocking still alerts" "1" "$(wc -l < "${NOTIFY_LOG}")"
+check "the alert names the reason"        "1" "$(grep -c '^CALL Agent blocked: loud$' "${NOTIFY_LOG}")"
+"${FLEET}" unblock --all >/dev/null
+
 "${FLEET}" claim solo >/dev/null
 "${FLEET}" reset --older-than 0 >/dev/null
 check "reset recovers a dead agent's task" "1" "$("${FLEET}" plan --count)"
@@ -251,7 +280,12 @@ git add -A >/dev/null
 git -c user.email=t@e -c user.name=t -c commit.gpgsign=false commit -qm init --no-verify >/dev/null 2>&1
 BEFORE_IGNORE="$(cat .gitignore)"
 "${FLEET}" init >/dev/null
-check "init leaves the repo clean"      "" "$(git status --porcelain)"
+# The starter checklist is the ONLY thing init adds to a repo, and it is left
+# visible on purpose: it is the user's own content, so excluding it would keep
+# their backlog out of their own repo. Fleet's machine-local artifacts must
+# still never appear — that is what this pair pins down.
+check "init adds only the checklist"    "?? TASKS.md" "$(git status --porcelain)"
+check "the checklist is theirs to commit" "1" "$(git check-ignore -q TASKS.md; echo $?)"
 check "init does not touch .gitignore"  "${BEFORE_IGNORE}" "$(cat .gitignore)"
 check ".agents/ is excluded"            "0" "$(git check-ignore -q .agents; echo $?)"
 
@@ -269,7 +303,7 @@ import json
 t=[x for x in json.load(open('.vscode/tasks.json'))['tasks'] if x['label']=='build'][0]
 print(t['group']['isDefault'])")"
 "${FLEET}" clean >/dev/null
-check "clean restores the original"     "" "$(git status --porcelain)"
+check "clean restores the original"     "?? TASKS.md" "$(git status --porcelain)"
 
 # a queue that leaked into git must be caught
 mkdir -p .agents/queue/inbox && echo '{}' > .agents/queue/inbox/leak.json
@@ -328,6 +362,28 @@ check "a working browser clears the problem"     "0" \
 # --------------------------------------------------------------------------- #
 group "checklist bridge"
 
+# -- the starter checklist init leaves behind --------------------------------
+# Its examples are indented on purpose, so a brand-new project starts with an
+# empty queue: a first `from-note` that invented six tasks would be a trap.
+S="${TMP}/starter"; mkdir -p "${S}"; cd "${S}"; "${FLEET}" init >/dev/null
+check "init creates a starter checklist" "yes" "$([[ -f TASKS.md ]] && echo yes || echo no)"
+"${FLEET}" from-note >/dev/null 2>&1
+check "the starter queues nothing"       "0" \
+      "$("${FLEET}" list inbox | grep -cE '^  [0-9a-f]{8}')"
+
+S2="${TMP}/starter-off"; mkdir -p "${S2}"; cd "${S2}"
+"${FLEET}" init --no-checklist >/dev/null
+check "--no-checklist skips it"          "no" "$([[ -f TASKS.md ]] && echo yes || echo no)"
+
+# A checklist the project already keeps is theirs. Never add a second one, and
+# never rewrite the first.
+S3="${TMP}/starter-keep"; mkdir -p "${S3}"; cd "${S3}"
+printf '## TODO\n\n- [ ] mine\n' > TODO.md
+"${FLEET}" init >/dev/null
+check "an existing checklist is honoured" "no" "$([[ -f TASKS.md ]] && echo yes || echo no)"
+check "and is left byte-for-byte alone"   "- [ ] mine" "$(grep -m1 mine TODO.md)"
+
+# -- promotion ---------------------------------------------------------------
 N="${TMP}/checklist"; mkdir -p "${N}"; cd "${N}"; "${FLEET}" init >/dev/null
 cat > TASKS.md <<'MD'
 # Backlog
