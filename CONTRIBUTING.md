@@ -4,7 +4,7 @@ Thanks for looking. The bar is simple: **the self-test stays green and new
 behaviour arrives with a check that proves it.**
 
 ```bash
-./bin/selftest        # 79 checks, no browser or API key needed
+./bin/selftest        # 85 checks, no browser or API key needed
 ./bin/selftest -v     # show each command as it runs
 ```
 

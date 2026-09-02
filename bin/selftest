@@ -398,14 +398,30 @@ cat > TASKS.md <<'MD'
 - [ ] ? `N4` · which option should I take
 - [ ] 🔒 `N5` · hands off
 - [x] `N6` · already done
+- [ ] `N7` · rewrite the CLI reference
+  - touches: docs/cli.md
+- [ ] `N8` · the DRAFT is ready and 🔒 nothing is posted yet!!
+  - touches: docs/plan.md
 MD
 OUT="$("${FLEET}" from-note)"
-check "checklist items become tasks"   "3" "$(grep -cE '^[0-9a-f]{8} ' <<<"${OUT}")"
+check "checklist items become tasks"   "5" "$(grep -cE '^[0-9a-f]{8} ' <<<"${OUT}")"
 check "? and 🔒 are never queued"      "1" "$(grep -c 'skipped 2' <<<"${OUT}")"
 check "! raises priority"              "1" "$("${FLEET}" list inbox | grep -c 'p2 ')"
-check "⇒ forces the serial lane"       "1" "$("${FLEET}" list inbox | grep -c 'serial')"
+check "⇒ forces the serial lane"       "1" "$(grep -cE '^[0-9a-f]{8} +serial +p[0-9]+ +.*changelog' <<<"${OUT}")"
+
+# ⛔ The parallel lane is OPT-IN. This used to return `agent` — the CONCURRENT lane — for
+# everything not ⇒-marked and without a URL, so two items writing the same file were handed to
+# two workers at once, and nothing recorded which files an item writes so nothing could tell.
+check "undeclared work runs serial"    "1" "$(grep -cE '^[0-9a-f]{8} +serial +p[0-9]+ +.*summary' <<<"${OUT}")"
+check "touches: earns the agent lane"  "1" "$(grep -cE '^[0-9a-f]{8} +agent +p[0-9]+ +.*CLI reference' <<<"${OUT}")"
+
+# ⛔ Markers count only in the prefix. `"🔒" in body` silently dropped a real kubeintellect item
+# whose title is followed by the prose "🔒 the DRAFT is ready"; `"!!" in body` invented a
+# priority from an exclamation mark in a sentence.
+check "prose 🔒 does not drop an item"  "1" "$(grep -cE '^[0-9a-f]{8} +agent +p[0-9]+ +.*DRAFT is ready' <<<"${OUT}")"
+check "prose !! does not set priority" "0" "$("${FLEET}" list inbox | grep -c 'p1 ')"
 check "sub-steps stay with their task" "0" "$("${FLEET}" list inbox | grep -c 'sub-step')"
-check "re-running does not duplicate"  "3" \
+check "re-running does not duplicate"  "5" \
       "$("${FLEET}" from-note >/dev/null; "${FLEET}" list inbox | grep -cE '^  [0-9a-f]{8}')"
 
 cp TASKS.md "${TMP}/checklist.before"
@@ -429,6 +445,33 @@ command -v claude >/dev/null && ok "claude on PATH" \
   || skip "claude CLI" "workers cannot start without it"
 
 # --------------------------------------------------------------------------- #
+group "colliding work is never handed to two workers"
+
+# ⛔ THE FAILURE THIS WHOLE CHANGE EXISTS TO PREVENT. Two agent-lane items writing the SAME
+# file used to be claimable at once: `classify` put everything undeclared in the concurrent
+# lane, and nothing recorded which files a task writes, so nothing could tell.
+#
+# Asserted as an INVARIANT over whatever ends up in flight, not as a claim-by-claim script:
+# the queue carries tasks from earlier groups, and a test that assumed an empty inbox would
+# pass or fail on ordering rather than on the property.
+cat > COLLIDE.md <<'MD'
+## READY
+
+- [ ] `C1` · first writer
+  - touches: shared/thing.py
+- [ ] `C2` · second writer, same file
+  - touches: shared/thing.py
+- [ ] `C3` · unrelated writer
+  - touches: docs/other.md
+MD
+"${FLEET}" from-note --note COLLIDE.md >/dev/null 2>&1
+for i in 1 2 3 4 5 6 7 8 9 10; do "${FLEET}" claim "w${i}" --exec agent >/dev/null 2>&1 || true; done
+INFLIGHT="$(find . -path '*/queue/active/*.json' -exec cat {} + 2>/dev/null \
+            | grep -c '"shared/thing.py"' || true)"
+check "only one writer of a file is live" "1" "${INFLIGHT}"
+check "the other is left in the inbox"    "1" \
+      "$(find . -path '*/queue/inbox/*.json' -exec cat {} + 2>/dev/null | grep -c '"shared/thing.py"' || true)"
+
 group "documentation matches reality"
 
 # The count below includes this check itself, so adding a check makes this fail

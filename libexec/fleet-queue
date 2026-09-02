@@ -35,6 +35,8 @@ Agent commands:  claim, done, block, fail, show
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fnmatch
 import json
 import os
 import re
@@ -640,20 +642,138 @@ def note_sections(text: str) -> dict[str, list[str]]:
     return sections
 
 
-def classify(body: str) -> dict | None:
+#: Everything between the checkbox and the title is where MARKERS live. Outside it, `?` is
+#: punctuation, `!` is emphasis and `🔒` is a word about locking.
+NOTE_MARKER_ZONE = re.compile(r"^(?:`[^`]{1,12}`|[!~?⇉⇒↻🔒]{1,3}|‼\ufe0f?|❓|🔴|⛔|⭐|·|\s)+")
+
+#: The paths an item declares it will WRITE, from its `touches:` line. Same field `notectl.py`
+#: reads; see the mska-note skill.
+NOTE_TOUCHES = re.compile(r"^[ \t]*[-*]?[ \t]*touches:[ \t]*(.+?)[ \t]*$", re.IGNORECASE)
+NOTE_READ_ONLY = frozenset({
+    "(read-only)", "read-only", "readonly", "read only", "(readonly)", "(read only)",
+    "none", "(none)", "nothing", "-", "—", "n/a",
+})
+
+
+def note_markers(body: str) -> str:
+    """The marker prefix of a note item — the only place a marker counts.
+
+    ⛔ Scanned over the WHOLE line, these are not markers. `"🔒" in body` dropped
+    kubeintellect `T203`, whose title is followed by the prose "🔒 the DRAFT is ready"; `"!!" in
+    body` invented a priority from an exclamation mark in a sentence; `"⇒" in body` serialised
+    any item whose text happened to contain an arrow. A marker is a marker because of WHERE it
+    is written. (Same defect, same fix, as `_marker_zone` in notectl.py.)
+    """
+    m = NOTE_MARKER_ZONE.match(body)
+    return (m.group(0) if m else "").replace("❓", "?")
+
+
+def note_touches(detail: list[str] | None) -> list[str] | None:
+    """Paths the item says it will write. ``None`` = undeclared. ``[]`` = declared read-only."""
+    if not detail:
+        return None
+    values = [m.group(1) for line in detail if (m := NOTE_TOUCHES.match(line))]
+    if not values:
+        return None
+    paths: list[str] = []
+    for raw in values:
+        raw = raw.strip().strip("`").strip()
+        if raw.lower() in NOTE_READ_ONLY:
+            continue
+        for part in re.split(r"[,;]", raw):
+            part = part.strip().strip("`").strip().lstrip("./")
+            if part and part not in paths:
+                paths.append(part)
+    return paths
+
+
+CLAIM_LOCK = "claim.lock"
+CLAIM_LOCK_STALE_S = 30       # a claim is a rename; anything older than this is a dead worker
+
+
+@contextlib.contextmanager
+def claim_gate():
+    """Serialise the check-then-rename of a claim. Brief by construction.
+
+    ⛔ Breaking a stale gate is a RENAME, never an unlink: `unlink` removes whatever sits at the
+    path, which may be a lock another worker created a microsecond ago, and then two workers
+    hold it. (Same defect, same fix, as the note lock in notectl.py.)
+    """
+    lock = QUEUE / CLAIM_LOCK
+    for _ in range(200):                    # ~2 s of patience, then break a dead gate
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > CLAIM_LOCK_STALE_S:
+                    os.rename(lock, lock.with_suffix(f".broken-{os.getpid()}"))
+                    (lock.with_suffix(f".broken-{os.getpid()}")).unlink(missing_ok=True)
+                    continue
+            except (FileNotFoundError, OSError):
+                continue
+            time.sleep(0.01)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            lock.unlink()
+
+
+def paths_collide(a: str, b: str) -> bool:
+    """Do two declared paths write the same thing? Directories and globs count.
+
+    Every ambiguity resolves toward COLLIDE: a false collision costs one serial run, a missed
+    one costs a lost edit that is invisible in the run that caused it. Mirrors `_paths_collide`
+    in notectl.py so the two readers agree about the same note.
+    """
+    x, y = a.lower().rstrip("/"), b.lower().rstrip("/")
+    if x == y:
+        return True
+    if ("/" not in x or "/" not in y) and x.rsplit("/", 1)[-1] == y.rsplit("/", 1)[-1]:
+        return True
+    for m, n in ((x, y), (y, x)):
+        if n.startswith(m + "/") or fnmatch.fnmatchcase(n, m):
+            return True
+    return False
+
+
+def active_touches() -> list[str]:
+    """Every path an in-flight task said it would write."""
+    out: list[str] = []
+    for path in task_files("active"):
+        try:
+            out.extend(read_task(path).get("touches") or [])
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    return out
+
+
+def classify(body: str, detail: list[str] | None = None) -> dict | None:
     """Map one note item onto a queue task. None = deliberately not ours."""
+    zone = note_markers(body)
     # Markers that mean "not for an agent": yours to decide, or hands off.
-    if "🔒" in body or body.lstrip().startswith(("?", "-x")):
+    if "🔒" in zone or "?" in zone or body.lstrip().startswith("-x"):
         return None
 
-    priority = 1 if "!!" in body else 2 if "!" in body else 8 if "~" in body else 5
+    priority = 1 if "!!" in zone else 2 if "!" in zone else 8 if "~" in zone else 5
 
-    # The note's own parallelism markers win: ⇉ parallel, ⇒ serial.
+    # ⛔ THE PARALLEL LANE IS OPT-IN, AND IT DID NOT USED TO BE. This returned `agent` — the
+    # concurrent lane — for everything that was not `⇒`-marked and had no URL, so two items
+    # writing the SAME FILE were handed to two workers at once. Nothing recorded which files an
+    # item writes, so nothing could tell. An item now earns the parallel lane only by declaring
+    # `touches:`; undeclared is unknown, and unknown runs serial. That is the same rule
+    # `notectl.py plan` applies, so the note means one thing to both readers.
+    touches = note_touches(detail)
     url_match = URL_IN.search(body)
-    if "⇒" in body:
+    if "⇒" in zone:
         mode = "serial"
     elif url_match:
-        mode = "browser"
+        mode = "browser"                    # a browser task writes no repo files
+    elif touches is None:
+        mode = "serial"
     else:
         mode = "agent"
 
@@ -666,6 +786,7 @@ def classify(body: str) -> dict | None:
         "exec": mode,
         "priority": priority,
         "title": title[:120],
+        "touches": touches,
     }
 
 
@@ -711,7 +832,7 @@ def cmd_from_note(args) -> int:
             if body in seen:
                 skipped += 1
                 continue
-            spec = classify(body)
+            spec = classify(body, detail)
             if spec is None:
                 skipped += 1
                 continue
@@ -722,6 +843,7 @@ def cmd_from_note(args) -> int:
                 "url": spec["url"], "site": site_of(spec["url"]),
                 "kind": args.kind or config()["default_kind"],
                 "exec": spec["exec"], "title": spec["title"],
+                "touches": spec.get("touches"),
                 "notes": "\n".join(detail),
                 "priority": spec["priority"], "attempts": 0, "agent": None,
                 "note_file": str(note), "note_text": body,
@@ -1318,25 +1440,40 @@ def cmd_claim(args) -> int:
     meant for an in-session subagent (and vice versa).
     """
     ensure_dirs()
-    for path in task_files("inbox"):
-        if args.exec:
+    with claim_gate():
+        # ⛔ THE COLLISION CHECK AND THE RENAME MUST BE ONE CRITICAL SECTION. Checked outside a
+        # gate, two workers both read "nothing in flight touches my files" and both claimed —
+        # the exact time-of-check/time-of-use hole the atomic rename closes for task OWNERSHIP
+        # but cannot close for the FILES a task will write. Claims are a rename, so the section
+        # is microseconds; the tasks it protects run for minutes.
+        busy = active_touches()
+        for path in task_files("inbox"):
             try:
-                if read_task(path).get("exec", "browser") != args.exec:
-                    continue
+                peek = read_task(path)
             except (FileNotFoundError, json.JSONDecodeError):
                 continue
-        dest = QUEUE / "active" / path.name
-        try:
-            os.rename(path, dest)          # atomic: exactly one agent wins
-        except (FileNotFoundError, OSError):
-            continue                        # lost the race, try the next task
-        task = read_task(dest)
-        task["agent"] = args.agent
-        task["attempts"] = task.get("attempts", 0) + 1
-        log(task, "claimed", agent=args.agent)
-        write_task(dest, task)
-        print(json.dumps(task, indent=2))
-        return 0
+            if args.exec and peek.get("exec", "browser") != args.exec:
+                continue
+            # Only the concurrent lane can collide; `serial` runs alone and `browser` writes
+            # no repo files.
+            if peek.get("exec") == "agent":
+                mine = peek.get("touches") or []
+                clash = next((f"{m} ↔ {o}" for m in mine for o in busy
+                              if paths_collide(m, o)), None)
+                if clash:
+                    continue                # in flight elsewhere; leave it for a later claim
+            dest = QUEUE / "active" / path.name
+            try:
+                os.rename(path, dest)      # atomic: exactly one agent wins
+            except (FileNotFoundError, OSError):
+                continue                    # lost the race, try the next task
+            task = read_task(dest)
+            task["agent"] = args.agent
+            task["attempts"] = task.get("attempts", 0) + 1
+            log(task, "claimed", agent=args.agent)
+            write_task(dest, task)
+            print(json.dumps(task, indent=2))
+            return 0
     print(f"inbox empty{f' for lane {args.exec}' if args.exec else ''}", file=sys.stderr)
     return 3
 
