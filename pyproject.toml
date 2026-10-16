@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-fleet"
+name = "fleetq"
 dynamic = ["version"]
 description = "Run many Claude Code sessions in parallel against one shared task queue, sized to the work and the machine."
 readme = "README.md"

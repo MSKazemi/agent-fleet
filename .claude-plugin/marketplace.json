@@ -6,8 +6,8 @@
     {
       "name": "agent-fleet",
       "source": "./",
-      "description": "The agent-fleet skill: queue work, size the parallelism, run workers, park what needs a human. Requires the `fleet` CLI (pipx install agent-fleet).",
-      "version": "0.2.0",
+      "description": "The agent-fleet skill: queue work, size the parallelism, run workers, park what needs a human. Requires the `fleet` CLI (pipx install fleetq).",
+      "version": "0.2.1",
       "homepage": "https://mskazemi.com/agent-fleet/"
     }
   ]

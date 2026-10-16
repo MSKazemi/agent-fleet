@@ -81,7 +81,7 @@ git clone https://github.com/MSKazemi/agent-fleet ~/agent-fleet
 **Or install a release** (needs `python3` and `bash`; nothing else):
 
 ```bash
-pipx install agent-fleet           # or: pip install agent-fleet
+pipx install fleetq           # or: pip install fleetq
 fleet install-skill                # links the skill into ~/.claude/skills
 fleet --version
 ```
