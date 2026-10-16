@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-fleet"
+dynamic = ["version"]
+description = "Run many Claude Code sessions in parallel against one shared task queue, sized to the work and the machine."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.9"
+authors = [{ name = "Mohsen Seyedkazemi Ardebili" }]
+keywords = ["claude-code", "agents", "parallel", "task-queue", "orchestration", "automation"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://mskazemi.com/agent-fleet/"
+Source = "https://github.com/MSKazemi/agent-fleet"
+Issues = "https://github.com/MSKazemi/agent-fleet/issues"
+
+[project.scripts]
+fleet = "agent_fleet.cli:main"
+
+[tool.hatch.version]
+path = "VERSION"
+pattern = "(?P<version>\\d+\\.\\d+\\.\\d+)"
+
+# The repo keeps its bash/python tool at the top level (bin/, libexec/, skills/). The wheel
+# places those same trees inside the package so bin/fleet's REPO-relative lookups are unchanged.
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_fleet"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"bin/fleet" = "agent_fleet/bin/fleet"
+"libexec/fleet-queue" = "agent_fleet/libexec/fleet-queue"
+"skills/agent-fleet" = "agent_fleet/skills/agent-fleet"
+"VERSION" = "agent_fleet/VERSION"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "bin", "libexec", "skills", "VERSION", "LICENSE", "NOTICE",
+           "README.md", "CHANGELOG.md", "CITATION.cff", "pyproject.toml"]

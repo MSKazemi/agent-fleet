@@ -25,7 +25,7 @@ resolve_root() {
   if [[ -n "${AGENT_ROOT:-}" ]]; then echo "${AGENT_ROOT}"; return; fi
   local dir="${PWD}"
   while [[ "${dir}" != "/" ]]; do
-    [[ -d "${dir}/.agents" ]] && { echo "${dir}"; return; }
+    [[ -d "${dir}/${AGENT_DIR:-.agents}" ]] && { echo "${dir}"; return; }
     dir="$(dirname "${dir}")"
   done
   local top
@@ -34,8 +34,26 @@ resolve_root() {
 }
 
 ROOT="$(resolve_root)"
-PROJECT="$(basename "${ROOT}")"
-TASKS="${ROOT}/.vscode/tasks.json"
+
+# THREE PATHS, NOT ONE — they coincide in the usual case and must stay separate in the rest.
+#
+#   ROOT        whose queue is in scope.
+#   AGENTS      where that queue, its logs, config and probe live: <ROOT>/$AGENT_DIR, which is
+#               ".agents" unless the project names it otherwise (same variable the queue engine
+#               reads, so the two halves cannot disagree about where the queue is).
+#   WORKSPACE   the folder VS Code has OPEN. tasks.json is only ever read from there and the
+#               window title is named after it. Defaults to ROOT; a project that keeps its queue
+#               in a subfolder of the repo it opens sets FLEET_WORKSPACE to that repo, or
+#               tasks.json is written somewhere VS Code never looks.
+AGENTS="${ROOT}/${AGENT_DIR:-.agents}"
+WORKSPACE="${FLEET_WORKSPACE:-${ROOT}}"
+PROJECT="$(basename "${WORKSPACE}")"
+TASKS="${WORKSPACE}/.vscode/tasks.json"
+
+# What a worker needs in its environment to find THIS queue. AGENT_DIR is forwarded only when
+# set: a VS Code task does not inherit this shell, so a renamed queue would otherwise be
+# invisible to the very workers it was built for.
+WORKER_ENV="AGENT_ROOT=${ROOT}${AGENT_DIR:+ AGENT_DIR=${AGENT_DIR}}"
 
 queue() { AGENT_ROOT="${ROOT}" "${QUEUE_BIN}" "$@"; }
 
@@ -52,6 +70,7 @@ SETUP
   fleet where                    which project's queue is in scope
   fleet machine                  what this computer can spare, and why
   fleet doctor [--fix]           prove nothing can leak, and that work is runnable
+  fleet --version                print the installed version
   fleet probe-browser            ask a worker whether it can actually open a tab
 
 QUEUE WORK
@@ -108,13 +127,79 @@ require_gui() {
   gui_available || die "$(gui_missing_reason); use --headless to run without terminals"
 }
 
+# Standalone terminal windows: the visible mode that needs neither X11 nor xdotool.
+#
+# The VS Code path presses a key into another application's window, which only works on an X11
+# session. Most current desktops are Wayland, where `fleet run` used to fall back to headless —
+# a print-mode session with NO Chrome tools, so every browser task came back blocked. A terminal
+# emulator needs none of that: it is started like any program, opens its own window, and the
+# `claude` inside it is a normal interactive session, which is the kind that is offered Chrome.
+EMULATORS=(gnome-terminal kitty alacritty konsole xfce4-terminal x-terminal-emulator xterm)
+
+find_emulator() {
+  local t
+  [[ -n "${FLEET_TERMINAL:-}" ]] && { command -v "${FLEET_TERMINAL}" && return; }
+  for t in "${EMULATORS[@]}"; do command -v "${t}" && return; done
+  return 1
+}
+
+windows_available() {
+  [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && find_emulator >/dev/null
+}
+
+# emulator_argv TITLE CMD  — print the argv (NUL-separated) that opens CMD in a new window.
+emulator_argv() {
+  local title="$1" cmd="$2" bin name
+  bin="$(find_emulator)" || return 1
+  name="$(basename "${bin}")"
+  case "${name}" in
+    gnome-terminal)    printf '%s\0' "${bin}" --title "${title}" -- bash -lc "${cmd}" ;;
+    kitty)             printf '%s\0' "${bin}" --title "${title}" bash -lc "${cmd}" ;;
+    alacritty)         printf '%s\0' "${bin}" --title "${title}" -e bash -lc "${cmd}" ;;
+    xfce4-terminal)    printf '%s\0' "${bin}" --title "${title}" -x bash -lc "${cmd}" ;;
+    konsole)           printf '%s\0' "${bin}" -e bash -lc "${cmd}" ;;
+    *)                 printf '%s\0' "${bin}" -T "${title}" -e bash -lc "${cmd}" ;;
+  esac
+}
+
+# launch_windows CWD N CMD...  — one window per worker, staggered, admission-controlled.
+launch_windows() {
+  local cwd="$1" n="$2"; shift 2
+  local cmds=("$@") i started=0 inner argv=()
+  mkdir -p "${AGENTS}/logs"
+  for i in $(seq 1 "${n}"); do
+    if [[ "${i}" -gt 1 ]]; then
+      if [[ "${FORCE:-0}" -eq 0 ]]; then
+        local room
+        room="$(queue machine --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["capacity"])')"
+        if [[ "${room}" -lt 1 ]]; then
+          echo "  stopping at $((i - 1)) worker(s): no headroom left on this machine"
+          echo "  the remaining tasks stay queued — run fleet run again when it frees up"
+          break
+        fi
+      fi
+      sleep "${STAGGER:-8}"
+    fi
+    # `exec` would replace the shell and close the window the instant a worker dies, taking its
+    # error with it. Keep the window until someone has read why.
+    inner="cd '${cwd}' && ${cmds[$((i-1))]/ exec / }; rc=\$?; echo; echo \"[agent-${i}] exited with status \${rc} - press Enter to close\"; read -r _"
+    mapfile -d '' argv < <(emulator_argv "agent-${i}" "${inner}")
+    if setsid "${argv[@]}" >>"${AGENTS}/logs/agent-${i}.launch.log" 2>&1 </dev/null & then
+      started=$((started + 1))
+      echo "  agent-${i}  window opened (${argv[0]##*/})"
+    fi
+  done
+  echo "opened ${started}/${n} window(s); each is one interactive Claude session started with --chrome"
+  [[ "${started}" -ge 1 ]]
+}
+
 # Start workers as detached background processes instead of VS Code terminals.
 # No X11, no window, no focus stolen — the trade is that you read progress from
 # .agents/logs/agent-N.log instead of watching a terminal panel.
 launch_headless() {
   local cwd="$1" n="$2"; shift 2
   local cmds=("$@") i pid logfile started=0 alive=0 pids=()
-  mkdir -p "${ROOT}/.agents/logs"
+  mkdir -p "${AGENTS}/logs"
   for i in $(seq 1 "${n}"); do
     # Admission control: the machine is re-read between starts, because the
     # workers already running are themselves changing the answer.
@@ -127,7 +212,7 @@ launch_headless() {
         break
       fi
     fi
-    logfile="${ROOT}/.agents/logs/agent-${i}.log"
+    logfile="${AGENTS}/logs/agent-${i}.log"
     setsid bash -c "cd '${cwd}' && ${cmds[$((i-1))]}" >>"${logfile}" 2>&1 &
     pid=$!
     pids+=("${pid}")
@@ -138,11 +223,11 @@ launch_headless() {
   for pid in "${pids[@]}"; do kill -0 "${pid}" 2>/dev/null && alive=$((alive + 1)); done
   echo "started ${started}/${n}; still running after 5s: ${alive}"
   if [[ "${started}" -lt "${n}" ]]; then
-    echo "WARNING: not every worker started — read .agents/logs/agent-*.log" >&2
+    echo "WARNING: not every worker started — read ${AGENTS}/logs/agent-*.log" >&2
     return 1
   fi
   [[ "${alive}" -lt "${n}" ]] && echo "note: $(( n - alive )) already exited — that is normal for a short queue, but check the logs if unexpected"
-  echo "follow them with:  tail -f ${ROOT}/.agents/logs/agent-*.log"
+  echo "follow them with:  tail -f ${AGENTS}/logs/agent-*.log"
   return 0
 }
 
@@ -166,7 +251,7 @@ count_shells() { pgrep -c -u "$(id -u)" bash || true; }
 # pgrep would count every unrelated Claude session and make the check meaningless.
 count_agents() {
   local pid count=0
-  for pid in $(pgrep -f -u "$(id -u)" 'claude --dangerously-skip-permissions' 2>/dev/null || true); do
+  for pid in $(pgrep -f -u "$(id -u)" 'claude( --chrome)? --dangerously-skip-permissions' 2>/dev/null || true); do
     if grep -qz "AGENT_ROOT=${ROOT}" "/proc/${pid}/environ" 2>/dev/null \
        || [[ "$(readlink -f "/proc/${pid}/cwd" 2>/dev/null)" == "${ROOT}" ]]; then
       count=$((count + 1))
@@ -186,8 +271,8 @@ send_key() {
 # any tasks the project already had are preserved.
 write_tasks() {
   local delay="$1"; shift
-  mkdir -p "${ROOT}/.vscode" "${ROOT}/.agents"
-  python3 - "${TASKS}" "${delay}" "${ROOT}/.agents/tasks.json.orig" "${STAGGER:-8}" "$@" <<'PY'
+  mkdir -p "${WORKSPACE}/.vscode" "${AGENTS}"
+  python3 - "${TASKS}" "${delay}" "${AGENTS}/tasks.json.orig" "${STAGGER:-8}" "$@" <<'PY'
 import json, os, re, shutil, sys
 out, delay, orig, stagger, cmds = (sys.argv[1], sys.argv[2], sys.argv[3],
                                    sys.argv[4], sys.argv[5:])
@@ -322,10 +407,10 @@ cmd_launch() {
 
 # The tool a worker needs before it can obey the "open your own tab" rule.
 BROWSER_TOOL="mcp__claude-in-chrome__tabs_create_mcp"
-PROBE_FILE_REL=".agents/browser-probe.json"
+PROBE_FILE="${AGENTS}/browser-probe.json"
 
 worker_command() {
-  python3 - "${ROOT}/.agents/config.json" <<'PY'
+  python3 - "${AGENTS}/config.json" <<'PY'
 import json, sys
 try:
     print(json.load(open(sys.argv[1]))["worker_command"])
@@ -361,7 +446,7 @@ EOF
     esac
   done
 
-  [[ -d "${ROOT}/.agents" ]] || die "no fleet project here — run: fleet init"
+  [[ -d "${AGENTS}" ]] || die "no fleet project here — run: fleet init"
   cmd="$(worker_command)"
   cwd="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["worker_cwd"])' \
          "$(queue plan --json)")"
@@ -370,12 +455,12 @@ EOF
   if [[ "${dry}" -eq 1 ]]; then
     echo "--dry: would run in ${cwd}"
     echo "  ${cmd} -p '<one YES/NO question about ${BROWSER_TOOL}>'"
-    echo "  and record the answer in ${ROOT}/${PROBE_FILE_REL}"
+    echo "  and record the answer in ${PROBE_FILE}"
     return 0
   fi
 
   echo "asking one worker-shaped session whether it has a browser (up to ${timeout}s)..."
-  out="$(cd "${cwd}" && AGENT_ROOT="${ROOT}" AGENT_ID=probe \
+  out="$(cd "${cwd}" && env ${WORKER_ENV} AGENT_ID=probe \
          timeout "${timeout}" setsid ${cmd} -p "${question}" </dev/null 2>&1 || true)"
   first="$(grep -oE '[A-Za-z]+' <<<"${out}" | head -1 | tr '[:lower:]' '[:upper:]')"
 
@@ -387,7 +472,7 @@ EOF
          return 2 ;;
   esac
 
-  python3 - "${ROOT}/${PROBE_FILE_REL}" "${verdict}" "${cmd}" "${out}" <<'PY'
+  python3 - "${PROBE_FILE}" "${verdict}" "${cmd}" "${out}" <<'PY'
 import json, sys, time
 path, verdict, cmd, out = sys.argv[1:5]
 json.dump({
@@ -409,7 +494,7 @@ PY
 
   if [[ "${verdict}" == "true" ]]; then
     echo "YES — a worker session can open a Chrome tab; the browser lane is real here"
-    echo "  recorded in ${PROBE_FILE_REL}"
+    echo "  recorded in ${PROBE_FILE}"
     return 0
   fi
   cat <<EOF
@@ -421,7 +506,7 @@ NO — a PRINT-mode session has no browser tools, so it cannot open a tab
   own per-session tab group. Two sessions can hold live connections to one
   Chrome at the same time — measured, not assumed.
   So: use terminals for browser work, or move it to a session that has a tab.
-  recorded in ${PROBE_FILE_REL}
+  recorded in ${PROBE_FILE}
 EOF
   return 1
 }
@@ -435,7 +520,7 @@ EOF
 # that works.
 warn_if_no_browser() {
   local headless="${1:-1}"
-  python3 - "${ROOT}/${PROBE_FILE_REL}" "${headless}" <<'PY'
+  python3 - "${PROBE_FILE}" "${headless}" <<'PY'
 import json, sys
 try:
     p = json.load(open(sys.argv[1]))
@@ -461,12 +546,13 @@ PY
 # The worker prompt is embedded in a single-quoted shell string inside a JSON
 # string, so it deliberately contains no single quotes.
 worker_prompt() {
-  local id="$1"
-  echo "You are ${id}, one browser worker in a parallel fleet. Load the agent-fleet skill and follow its worker protocol reference exactly: claim a task with fleet claim ${id} --exec browser, do it in your own Chrome tab, then report it with fleet done/block/fail. Repeat until fleet claim reports the lane is empty, then stop and print a summary of what you completed."
+  local id="$1" ask=""
+  [[ "${ASK:-0}" -eq 1 ]] && ask=" This run is interactive: at a login, captcha, 2FA or a question only the human can answer, still run fleet block with the reason and leave your tab open, then stay in this window and tell the human exactly what you need. When they reply, run fleet unblock with the task id (add --answer with their words if they answered a question), claim again and continue in the same tab. The other workers keep going while you wait. Never enter credentials or solve a captcha yourself."
+  echo "You are ${id}, one browser worker in a parallel fleet. Load the agent-fleet skill and follow its worker protocol reference exactly: claim a task with fleet claim ${id} --exec browser, do it in your own Chrome tab, then report it with fleet done/block/fail. Repeat until fleet claim reports the lane is empty, then stop and print a summary of what you completed.${ask}"
 }
 
 cmd_run() {
-  local n="" delay="${DEFAULT_DELAY}" dry=0 force=0 max="" headless="" i cmds=()
+  local n="" delay="${DEFAULT_DELAY}" dry=0 force=0 max="" headless="" windows=0 vscode=0 i cmds=() ASK=0 chrome=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --delay)    delay="${2:?--delay needs seconds}"; shift 2 ;;
@@ -476,20 +562,30 @@ cmd_run() {
       --stagger)  STAGGER="${2:?--stagger needs seconds}"; export STAGGER; shift 2 ;;
       --headless) headless=1; shift ;;
       --terminals) headless=0; shift ;;
+      --windows)  headless=0; windows=1; shift ;;
+      --vscode)   headless=0; vscode=1; shift ;;
+      --ask)      ASK=1; shift ;;
       auto)       n=""; shift ;;
       [0-9]*)     n="$1"; shift ;;
       -h|--help)  cat <<'EOF'
-usage: fleet run [N] [--max N] [--delay S] [--headless|--terminals] [--dry]
+usage: fleet run [N] [--max N] [--delay S] [--headless|--terminals|--windows|--vscode] [--ask] [--dry]
 
   N            how many browser workers (default: whatever `fleet plan` says)
   --max N      cap the worker count for this run
   --delay S    seconds before each worker starts (default 10; terminals only)
   --headless   run workers as background processes, logging to .agents/logs/
-               (no X11, no VS Code, no focus stolen). Chosen automatically when
-               no usable X11 session is present.
+               (no window, no focus stolen) — but a headless session has no Chrome, so
+               browser tasks come back blocked. Chosen only when there is no display.
   --force      ignore what the machine can spare (can overload it)
   --stagger S  seconds between worker starts (default 8) so memory ramps
-  --terminals  force VS Code terminals even if X11 looks unavailable
+  --terminals  VS Code terminals (X11 + xdotool); with no X11 it opens windows instead
+  --ask        interactive workers: at a login, captcha or question they stay in their
+               own window and tell you what they need, then resume when you answer there.
+               Default is to park the task and move on (see the worker protocol).
+  --vscode     VS Code terminals only, never windows (needs X11 + xdotool to start them)
+  --windows    one standalone terminal-emulator window per worker — works on Wayland,
+               needs no xdotool. $FLEET_TERMINAL picks the emulator (default: first of
+               gnome-terminal, kitty, alacritty, konsole, xfce4-terminal, xterm found)
   --dry        write .vscode/tasks.json and stop
 EOF
                   return 0 ;;
@@ -497,7 +593,7 @@ EOF
     esac
   done
 
-  [[ -d "${ROOT}/.agents" ]] || die "no fleet project here — run: fleet init"
+  [[ -d "${AGENTS}" ]] || die "no fleet project here — run: fleet init"
 
   # Size the fleet from the queue itself unless a count was given. Only the
   # browser lane needs terminals; agent and serial work runs in-session for free.
@@ -545,18 +641,28 @@ PY
          "$(queue plan --json)")"
   [[ "${cwd}" == "${ROOT}" ]] || echo "workers start in ${cwd} (workers_start_in), queue stays ${ROOT}"
 
-  # Headless unless a usable X11 session is available, or forced either way.
+  # VS Code terminals on X11; otherwise standalone windows if there is a display and an
+  # emulator; headless only as the last resort (it cannot do browser work), or when forced.
   if [[ -z "${headless}" ]]; then
-    if gui_available; then headless=0; else
+    if gui_available; then headless=0
+    elif windows_available; then
+      headless=0; windows=1
+      echo "no usable X11 ($(gui_missing_reason)) — opening terminal windows instead"
+    else
       headless=1
-      echo "no usable X11 ($(gui_missing_reason)) — running headless"
+      echo "no usable X11 and no terminal emulator on a display — running headless"
     fi
+  elif [[ "${headless}" -eq 0 && "${windows}" -eq 0 && "${vscode}" -eq 0 ]] \
+       && ! gui_available && windows_available; then
+    windows=1
+    echo "no usable X11 ($(gui_missing_reason)) — opening terminal windows instead"
   fi
+  [[ "${headless}" -eq 0 ]] && chrome=" --chrome"
 
   warn_if_no_browser "${headless}"
 
   for i in $(seq 1 "${n}"); do
-    cmds+=("AGENT_ROOT=${ROOT} AGENT_ID=agent-${i} exec claude --dangerously-skip-permissions '$(worker_prompt "agent-${i}")'")
+    cmds+=("${WORKER_ENV} AGENT_ID=agent-${i} exec claude${chrome} --dangerously-skip-permissions '$(worker_prompt "agent-${i}")'")
   done
 
   if [[ "${headless}" -eq 1 ]]; then
@@ -567,6 +673,17 @@ PY
     fi
     echo "starting ${n} headless worker(s):"
     FORCE="${force}" launch_headless "${cwd}" "${n}" "${cmds[@]}"
+    return
+  fi
+
+  if [[ "${windows}" -eq 1 ]]; then
+    if [[ "${dry}" -eq 1 ]]; then
+      echo "--dry: would open ${n} terminal window(s) via $(basename "$(find_emulator)") in ${cwd}:"
+      printf '  %s\n' "${cmds[@]}"
+      return 0
+    fi
+    echo "opening ${n} terminal window(s):"
+    FORCE="${force}" launch_windows "${cwd}" "${n}" "${cmds[@]}"
     return
   fi
 
@@ -582,7 +699,7 @@ cmd_status() {
   echo "project:  ${PROJECT}  (${ROOT})"
   echo "agents:   $(count_agents) running here"
   [[ -f "${TASKS}" ]] && echo "tasks:    ${TASKS}" || echo "tasks:    (none generated)"
-  if [[ -d "${ROOT}/.agents" ]]; then
+  if [[ -d "${AGENTS}" ]]; then
     printf 'queue:    '
     queue status
   else
@@ -591,13 +708,13 @@ cmd_status() {
 }
 
 cmd_clean() {
-  local orig="${ROOT}/.agents/tasks.json.orig"
+  local orig="${AGENTS}/tasks.json.orig"
   if [[ -f "${orig}" ]]; then
     mv "${orig}" "${TASKS}"
     echo "restored the project's original ${TASKS}"
   else
     rm -f "${TASKS}"
-    rmdir "${ROOT}/.vscode" 2>/dev/null || true
+    rmdir "${WORKSPACE}/.vscode" 2>/dev/null || true
     echo "removed ${TASKS}"
   fi
 }
@@ -617,6 +734,8 @@ case "${1:-}" in
   init|where|machine|doctor|add|add-batch|from-note|to-note|plan|list|watch|blocked|\
   unblock|reset|claim|done|block|fail|show)
           queue "$@" ;;
+
+  version|--version|-V) echo "agent-fleet $(tr -d '[:space:]' < "${REPO}/VERSION")" ;;
 
   ""|help|-h|--help) usage ;;
   *) echo "fleet: unknown command '$1'" >&2; echo >&2; usage >&2; exit 2 ;;

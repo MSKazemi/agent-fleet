@@ -75,17 +75,35 @@ agent-fleet is the small amount of machinery that fixes exactly those five thing
 ```bash
 git clone https://github.com/MSKazemi/agent-fleet ~/agent-fleet
 ~/agent-fleet/bin/install      # symlinks `fleet` into ~/.local/bin, the skill into ~/.claude/skills
-~/agent-fleet/bin/selftest     # 85 checks, no browser needed
+~/agent-fleet/bin/selftest     # 111 checks, no browser needed
 ```
 
-Symlinks, not copies — the clone stays the single source of truth, so an edit
+**Or install a release** (needs `python3` and `bash`; nothing else):
+
+```bash
+pipx install agent-fleet           # or: pip install agent-fleet
+fleet install-skill                # links the skill into ~/.claude/skills
+fleet --version
+```
+
+```text
+# Claude Code plugin marketplace (the skill only; the `fleet` CLI comes from pipx or the clone)
+/plugin marketplace add MSKazemi/agent-fleet
+/plugin install agent-fleet --marketplace MSKazemi/agent-fleet
+```
+
+Each [GitHub release](https://github.com/MSKazemi/agent-fleet/releases) also carries a tarball with
+its SHA-256 — extract it and run `bin/install`. Release notes live in [CHANGELOG.md](CHANGELOG.md).
+
+From a clone, the install is symlinks, not copies — the clone stays the single source of truth, so an edit
 takes effect in every project at once. Re-run `bin/install` after moving the
 clone; that repairs the links. `bin/install --uninstall` removes them.
 
 **Requirements:** `python3` (stdlib only) and [Claude
-Code](https://claude.com/claude-code). Terminals additionally need an X11 session
-with `xdotool`; without one, `fleet run --headless` starts detached workers
-instead. `notify-send` gives desktop alerts when an agent is blocked.
+Code](https://claude.com/claude-code). VS Code terminals additionally need an X11
+session with `xdotool`; without one, `fleet run` opens one standalone terminal
+window per worker (any of gnome-terminal, kitty, alacritty, konsole, xfce4-terminal,
+xterm), which works on Wayland. `notify-send` gives desktop alerts when an agent is blocked.
 
 ---
 
@@ -230,12 +248,24 @@ tells you how to run the rest in your current session. Override with `fleet run
 ### Two ways to start a worker
 
 ```bash
-fleet run              # VS Code terminals you can watch      (needs X11 + xdotool)
+fleet run              # terminals you can watch: VS Code on X11, else one window each
+fleet run --windows    # standalone terminal windows           (Wayland-safe, no xdotool)
+fleet run --vscode     # VS Code terminals only                (needs X11 + xdotool)
 fleet run --headless   # detached processes → .agents/logs/   (needs no desktop)
 ```
 
-Headless is chosen automatically when X11 is unavailable, so the fleet runs over
-SSH, on Wayland, or from cron. `--terminals` forces the visible path.
+Visible terminals are chosen automatically: VS Code when X11 and `xdotool` are
+there, otherwise standalone windows. Headless is the fallback only when there is no
+display at all (SSH, cron) — and a headless session has no Chrome, so browser
+tasks come back blocked. Every visible worker is started with `claude --chrome`.
+
+**A person in the loop.** By default a worker that meets a login, captcha, 2FA or a question it
+cannot answer truthfully parks the task (`fleet block`), leaves its tab open and moves on; you
+clear them in batches — `fleet blocked`, do the login in the tab, `fleet unblock ID`, or answer a
+question with `fleet unblock ID --answer "..."` (the answer is appended to the task's notes, and
+clearing a wall does not count as a failed attempt). `fleet run --ask` makes the workers
+interactive instead: they stay in their own window, tell you what they need, and resume when you
+reply there while the other workers keep going.
 
 ### Before the first browser lane, prove there is a browser
 
@@ -333,8 +363,9 @@ call per repo.
 
 ## Known limits
 
-- **Terminals need X11 + `xdotool`.** Everything else, including running the
-  fleet, works without them via `--headless`.
+- **VS Code terminals need X11 + `xdotool`.** Without them `fleet run` opens
+  standalone terminal windows instead; with no display at all, `--headless`.
+  Window mode is covered by stub-emulator checks, not yet by a live Chrome run.
 - **The browser lane needs terminals, not headless.** A terminal worker is
   `claude` run interactively: it is offered the Chrome toolset and gets its own
   per-session tab group, and two sessions can hold live connections to the *same*
@@ -342,7 +373,7 @@ call per repo.
   assumed. So N terminals really do give N parallel tabs. Print mode (`-p`) is
   the exception and has no browser at all, which is what `fleet probe-browser`
   measures; a NO from it is recorded as `"mode": "print"` and applies to
-  `--headless`, not to `fleet run --terminals`. A worker that finds no tab tool
+  `--headless`, not to `fleet run --terminals` or `--windows`. A worker that finds no tab tool
   still blocks its task instead of pretending.
 - **Terminal mode takes window focus** for a second or two per worker. Headless
   never does.
@@ -359,11 +390,16 @@ call per repo.
 
 ## How it works
 
+![Fleet dispatch flow: tasks enter the queue, the planner takes the tightest of the work, the cap, distinct hosts and machine capacity, and each worker claims, works and reports once; blocked tasks wait for a human and return in batches with fleet unblock --all.](docs/assets/dispatch-flow.png)
+
 ```
 bin/fleet                 one entry point: dispatch + the launcher
 libexec/fleet-queue       the queue engine (python3, stdlib only)
 bin/install               symlinks into ~/.local/bin and ~/.claude/skills
-bin/selftest              85 headless checks
+bin/selftest              111 headless checks
+src/agent_fleet/          the pip/pipx entry point (wraps bin/fleet)
+.claude-plugin/           Claude Code plugin + marketplace manifests
+VERSION                   the one place the version is written
 skills/agent-fleet/       the skill Claude loads (+ the worker protocol)
 ```
 
@@ -394,7 +430,7 @@ logging to `.agents/logs/`. Either way each worker gets its own `AGENT_ID` and
 | `fleet add-batch [FILE\|-]` | queue many (`URL \| title \| note`) |
 | `fleet from-note` / `to-note` | checklist → queue → checklist |
 | `fleet plan [--max N] [--count] [--json]` | the schedule |
-| `fleet run [N] [--max N] [--delay S] [--headless\|--terminals] [--dry]` | start the browser lane |
+| `fleet run [N] [--max N] [--delay S] [--headless\|--terminals\|--windows\|--vscode] [--dry]` | start the browser lane |
 | `fleet open N` / `launch N --cmd C [--headless]` | run things without the queue |
 | `fleet status` / `list [STATE]` / `watch` | see everything |
 | `fleet blocked` / `unblock ID\|--all` / `reset` | human-wall handling |

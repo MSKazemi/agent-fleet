@@ -8,6 +8,7 @@ Runs in ANY project. The queue lives next to the work, not next to this script:
 
     $AGENT_ROOT               if set, wins outright
     nearest ancestor with .agents/     the usual case, created by `fleet init`
+                              ($AGENT_DIR renames that directory; default ".agents")
     git repository root       first run in a repo
     $PWD                      last resort
 
@@ -103,6 +104,17 @@ def infer_exec(url: str, kind: str, browser_kinds: list[str] | None = None) -> s
 # --------------------------------------------------------------------------- #
 
 
+def queue_dirname() -> str:
+    """The queue directory's NAME under the project root: ``$AGENT_DIR``, else ``.agents``.
+
+    ⛔ ONE place decides it. Read it here and nowhere else — a second hardcoded ".agents"
+    (in `init`, in `doctor`, in the ignore rule) is how `init` builds one directory while
+    `add` writes another, leaving a phantom queue nothing reads. `bin/fleet` reads the same
+    variable, so the two halves of the command cannot disagree about where the queue is.
+    """
+    return os.environ.get("AGENT_DIR") or ".agents"
+
+
 def resolve_root() -> Path:
     env = os.environ.get("AGENT_ROOT")
     if env:
@@ -110,7 +122,7 @@ def resolve_root() -> Path:
 
     cwd = Path.cwd().resolve()
     for candidate in (cwd, *cwd.parents):
-        if (candidate / ".agents").is_dir():
+        if (candidate / queue_dirname()).is_dir():
             return candidate
 
     try:
@@ -127,7 +139,7 @@ def resolve_root() -> Path:
 
 
 ROOT = resolve_root()
-AGENTS_DIR = ROOT / ".agents"
+AGENTS_DIR = ROOT / queue_dirname()
 QUEUE = AGENTS_DIR / "queue"
 LOGS = AGENTS_DIR / "logs"
 CONFIG_PATH = AGENTS_DIR / "config.json"
@@ -227,7 +239,27 @@ def site_of(url: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-ARTIFACTS = (".agents/", ".vscode/tasks.json")
+TASKS_JSON = ".vscode/tasks.json"
+
+
+def artifacts(root: Path) -> tuple[str, ...]:
+    """The ignore patterns for this project's fleet artifacts.
+
+    The default queue keeps the unanchored ``.agents/`` it has always had. A RENAMED queue is
+    ignored by its anchored path instead: a bare ``fleet/`` would hide every directory of that
+    name anywhere in the tree, and the project's own ``fleet/`` source is exactly the kind of
+    thing that shares it.
+    """
+    name = queue_dirname()
+    if name == ".agents":
+        return (".agents/", TASKS_JSON)
+    queue_dir = (root / name).resolve()
+    top = git(root, "rev-parse", "--show-toplevel").stdout.strip() if in_git_repo(root) else ""
+    try:
+        rel = queue_dir.relative_to(Path(top).resolve()).as_posix() if top else name
+    except ValueError:
+        rel = name
+    return (f"/{rel}/", TASKS_JSON)
 EXCLUDE_HEADER = "# --- agent-fleet: local runtime, never commit ---"
 
 
@@ -260,8 +292,8 @@ def hide_artifacts(root: Path, quiet: bool = False) -> None:
         current = exclude.read_text() if exclude.exists() else ""
         # A tasks.json the project commits on purpose is its file, not ours —
         # excluding it would be a lie (git ignores nothing already tracked).
-        wanted = [a for a in ARTIFACTS
-                  if a != ".vscode/tasks.json" or not tasks_json_tracked(root)]
+        wanted = [a for a in artifacts(root)
+                  if a != TASKS_JSON or not tasks_json_tracked(root)]
         missing = [a for a in wanted if a not in current.split()]
         if missing:
             with open(exclude, "a") as fh:
@@ -276,7 +308,7 @@ def hide_artifacts(root: Path, quiet: bool = False) -> None:
     else:
         gitignore = root / ".gitignore"
         current = gitignore.read_text() if gitignore.exists() else ""
-        missing = [a for a in ARTIFACTS if a not in current.split()]
+        missing = [a for a in artifacts(root) if a not in current.split()]
         if missing:
             with open(gitignore, "a") as fh:
                 fh.write(f"\n{EXCLUDE_HEADER}\n" + "".join(f"{a}\n" for a in missing))
@@ -294,7 +326,7 @@ def cmd_init(args) -> int:
     An explicit path argument still wins over both.
     """
     root = Path(args.path).expanduser().resolve() if args.path else ROOT.resolve()
-    agents_dir = root / ".agents"
+    agents_dir = root / queue_dirname()
     for state in STATES:
         (agents_dir / "queue" / state).mkdir(parents=True, exist_ok=True)
     (agents_dir / "logs").mkdir(parents=True, exist_ok=True)
@@ -480,7 +512,7 @@ def cmd_doctor(args) -> int:
     # A tasks.json the project commits is the project's own file; the fleet only
     # merges into it and restores it. It is not a fleet artifact to hide.
     tasks_tracked = tasks_json_tracked(root)
-    ours = [a for a in ARTIFACTS if a != ".vscode/tasks.json" or not tasks_tracked]
+    ours = [a for a in artifacts(root) if a != TASKS_JSON or not tasks_tracked]
 
     # 1. are our artifacts ignored at all?
     for artifact in ours:
@@ -494,13 +526,13 @@ def cmd_doctor(args) -> int:
             problems.append(f"{artifact} is not ignored")
 
     # 2. is anything already tracked? that is what actually reaches GitHub.
-    tracked_queue = git(root, "ls-files", "--", ".agents").stdout.split()
+    tracked_queue = git(root, "ls-files", "--", queue_dirname()).stdout.split()
     if tracked_queue:
-        print(f"tracked: {len(tracked_queue)} file(s) under .agents/ ARE tracked ✗")
+        print(f"tracked: {len(tracked_queue)} file(s) under {queue_dirname()}/ ARE tracked ✗")
         for path in tracked_queue[:10]:
             print(f"           {path}")
         problems.append(f"{len(tracked_queue)} queue file(s) tracked by git")
-        fixes.append(["rm", "-r", "--cached", "--quiet", ".agents"])
+        fixes.append(["rm", "-r", "--cached", "--quiet", queue_dirname()])
     else:
         print("tracked: no queue file is tracked ✓")
 
@@ -1365,14 +1397,20 @@ def cmd_blocked(args) -> int:
     for reason, tasks in by_reason.items():
         print(f"\n{reason}  ({len(tasks)})")
         for task in tasks:
-            print(f"  {task['id']}  {task.get('title') or task['url']}")
+            who = f"   (was {task['agent']})" if task.get("agent") else ""
+            print(f"  {task['id']}  {task.get('title') or task['url']}{who}")
             print(f"          {task['url']}")
-    print("\nafter clearing these:  fleet unblock --all")
+            if reason.startswith("needs answer"):
+                print(f"          answer it:  fleet unblock {task['id']} --answer \"...\"")
+    print("\nafter clearing these:  fleet unblock --all   (or one task: fleet unblock ID [--answer ...])")
     return 0
 
 
 def cmd_unblock(args) -> int:
     ensure_dirs()
+    if args.answer and args.all:
+        print("--answer belongs to one task; give its id instead of --all", file=sys.stderr)
+        return 2
     if args.all:
         targets = task_files("blocked")
     else:
@@ -1389,7 +1427,16 @@ def cmd_unblock(args) -> int:
         task = read_task(path)
         task["agent"] = None
         task.pop("blocked_reason", None)
-        log(task, "unblocked", by="human")
+        # A wall a human has cleared is not a failed attempt. Without this, a task that met a
+        # login wall and then a captcha reached the worker's "attempts > 2 → fail" rule having
+        # done nothing wrong.
+        task["attempts"] = max(0, task.get("attempts", 0) - 1)
+        if args.answer:
+            # The worker reads `notes` on every claim, so this is how an answer reaches it. Kept
+            # as an appended line, never a replacement: the original brief must survive.
+            stamp = time.strftime("%Y-%m-%d %H:%M")
+            task["notes"] = (task.get("notes") or "") + f"\n[human answer {stamp}] {args.answer}"
+        log(task, "unblocked", by="human", **({"answer": args.answer} if args.answer else {}))
         write_task(path, task)
         move(path, "inbox")
         print(f"{task['id']} → inbox")
@@ -1609,6 +1656,8 @@ def main() -> int:
     p = sub.add_parser("unblock", help="return blocked task(s) to the inbox")
     p.add_argument("id", nargs="?")
     p.add_argument("--all", action="store_true")
+    p.add_argument("--answer", default="",
+                   help="the answer to a 'needs answer: ...' block; appended to the task's notes")
     p.set_defaults(func=cmd_unblock)
 
     p = sub.add_parser("reset", help="return stale active tasks to the inbox")

@@ -58,6 +58,13 @@ check "two projects stay independent" "1" \
 group "lane scheduling"
 
 W="${TMP}/lanes"; mkdir -p "${W}"; cd "${W}"; "${FLEET}" init >/dev/null
+# These checks are about the lane rule, not about how busy the host is right now. Without this
+# a loaded machine (another job, a build) correctly plans one worker and fails the suite.
+python3 - "${W}/.agents/config.json" <<'PY'
+import json, sys
+p = sys.argv[1]; c = json.load(open(p)); c["max_load_per_core"] = 1000
+json.dump(c, open(p, "w"), indent=2)
+PY
 "${FLEET}" add "https://site-one.example/a" --title one   >/dev/null
 "${FLEET}" add "https://site-one.example/b" --title two   >/dev/null
 "${FLEET}" add "https://site-two.example/c" --title three >/dev/null
@@ -290,7 +297,7 @@ check "init does not touch .gitignore"  "${BEFORE_IGNORE}" "$(cat .gitignore)"
 check ".agents/ is excluded"            "0" "$(git check-ignore -q .agents; echo $?)"
 
 "${FLEET}" add "https://g.example/1" --title g >/dev/null
-"${FLEET}" run --terminals --dry >/dev/null 2>&1   # force the tasks.json path
+"${FLEET}" run --vscode --dry >/dev/null 2>&1   # force the tasks.json path
 LABELS="$(python3 -c "
 import json;print(','.join(t['label'] for t in json.load(open('.vscode/tasks.json'))['tasks']))")"
 check "merge keeps the project's task"  "build,agent-1,agents: all" "${LABELS}"
@@ -471,6 +478,93 @@ INFLIGHT="$(find . -path '*/queue/active/*.json' -exec cat {} + 2>/dev/null \
 check "only one writer of a file is live" "1" "${INFLIGHT}"
 check "the other is left in the inbox"    "1" \
       "$(find . -path '*/queue/inbox/*.json' -exec cat {} + 2>/dev/null | grep -c '"shared/thing.py"' || true)"
+
+group "terminal windows without X11"
+
+# Most desktops are Wayland, where the VS Code/xdotool path cannot work and the old fallback was
+# headless — a session with no Chrome tools, so every browser task came back blocked. A stub
+# emulator stands in for the real one: the point is WHAT would be opened, not drawing a window.
+WN="${TMP}/windows"; mkdir -p "${WN}/bin"; cd "${WN}"; "${FLEET}" init >/dev/null
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "%s/call-$$.txt"\n' "${WN}" > "${WN}/bin/gnome-terminal"
+chmod +x "${WN}/bin/gnome-terminal"
+for u in a b c; do "${FLEET}" add "https://${u}.example/1" --title "${u}" >/dev/null; done
+WENV=(env PATH="${WN}/bin:${PATH}" XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-0 FLEET_TERMINAL=gnome-terminal)
+"${WENV[@]}" "${FLEET}" run 3 --stagger 0 --force >"${WN}/out.txt" 2>&1; sleep 1
+check "no X11 + a display opens windows"   "1" "$(grep -c 'opening terminal windows instead' "${WN}/out.txt")"
+check "one window per worker"              "3" "$(ls "${WN}"/call-*.txt 2>/dev/null | grep -c .)"
+check "each worker is started with --chrome" "3" "$(cat "${WN}"/call-*.txt | grep -c 'claude --chrome ')"
+check "workers get distinct ids"           "3" "$(cat "${WN}"/call-*.txt | grep -o 'AGENT_ID=agent-[0-9]' | sort -u | grep -c .)"
+check "a dead worker leaves its window up" "3" "$(cat "${WN}"/call-*.txt | grep -c 'press Enter to close')"
+check "--headless still means no window"   "0" \
+      "$("${WENV[@]}" "${FLEET}" run --headless --dry 2>&1 | grep -c 'terminal window')"
+
+group "human in the loop"
+
+# The wall a worker cannot pass is a person's to clear. These pin the loop: park with a reason,
+# the human answers or logs in, the task returns carrying the answer — and clearing a wall does
+# not count against the task.
+HL="${TMP}/human"; mkdir -p "${HL}"; cd "${HL}"; "${FLEET}" init >/dev/null
+"${FLEET}" add "https://h.example/form" --title form --note "apply with the standard CV" >/dev/null
+HID="$("${FLEET}" claim agent-9 | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+"${FLEET}" block "${HID}" --reason "needs answer: expected salary?" >/dev/null
+check "blocked list names the worker"    "1" "$("${FLEET}" blocked | grep -c 'was agent-9')"
+check "and says how to answer"           "1" "$("${FLEET}" blocked | grep -c 'unblock .* --answer')"
+check "--answer refuses --all"           "2" "$("${FLEET}" unblock --all --answer x >/dev/null 2>&1; echo $?)"
+"${FLEET}" unblock "${HID}" --answer "no figure; say negotiable" >/dev/null
+check "the answer reaches the next worker" "1" \
+      "$("${FLEET}" show "${HID}" | grep -c 'human answer .* no figure; say negotiable')"
+check "the original brief survives"      "1" "$("${FLEET}" show "${HID}" | grep -c 'standard CV')"
+check "clearing a wall is not an attempt" "0" \
+      "$("${FLEET}" show "${HID}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["attempts"])')"
+check "interactive prompt is opt-in"     "0" \
+      "$(env PATH="${WN}/bin:${PATH}" XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=w FLEET_TERMINAL=gnome-terminal "${FLEET}" run 1 --windows --dry 2>&1 | grep -c 'This run is interactive')"
+check "--ask puts the worker in the loop" "1" \
+      "$(env PATH="${WN}/bin:${PATH}" XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=w FLEET_TERMINAL=gnome-terminal "${FLEET}" run 1 --windows --ask --dry 2>&1 | grep -c 'This run is interactive')"
+
+# A worker started with --chrome must still be counted: status and the VS Code launch check both
+# find workers by their command line, and adding a flag once made every worker invisible.
+CNT="${TMP}/count"; mkdir -p "${CNT}"; cd "${CNT}"; "${FLEET}" init >/dev/null
+AGENT_ROOT="${CNT}" bash -c 'exec -a "claude --chrome --dangerously-skip-permissions" sleep 15' &
+CNT_PID=$!; sleep 1
+check "a --chrome worker is counted" "1" "$("${FLEET}" status | awk '/^agents:/{print $2}')"
+kill "${CNT_PID}" 2>/dev/null || true      # by pid: never by pattern, which would also hit real workers
+
+group "a renamed queue directory"
+
+# A project may keep its queue under another name and below the repo root (AGENT_DIR +
+# AGENT_ROOT). The engine and the launcher must agree about where it is, the ignore rule
+# must hide that directory and nothing else, and tasks.json belongs to the folder VS Code
+# opens (FLEET_WORKSPACE) — not to the folder the queue happens to sit in.
+RN="${TMP}/renamed"; mkdir -p "${RN}/data" "${RN}/other/fleet"; (cd "${RN}" && git init -q .)
+export AGENT_ROOT="${RN}/data" AGENT_DIR=fleet
+(cd "${RN}" && "${FLEET}" init >/dev/null)
+check "init builds the renamed queue"   "yes" "$([[ -d "${RN}/data/fleet/queue/inbox" ]] && echo yes)"
+check "and no phantom .agents beside it" "no" "$([[ -e "${RN}/data/.agents" ]] && echo yes || echo no)"
+(cd "${RN}" && "${FLEET}" add "https://r.example/1" --title r >/dev/null)
+check "add writes into that same queue" "1" \
+      "$(find "${RN}/data/fleet/queue/inbox" -name '*.json' | grep -c .)"
+check "the renamed queue is ignored"    "0" "$(cd "${RN}" && git check-ignore -q data/fleet; echo $?)"
+check "a same-named source dir is not"  "1" "$(cd "${RN}" && git check-ignore -q other/fleet; echo $?)"
+(cd "${RN}" && FLEET_WORKSPACE="${RN}" "${FLEET}" run --vscode --dry >/dev/null 2>&1) || true
+check "tasks.json goes to the workspace" "yes" \
+      "$([[ -f "${RN}/.vscode/tasks.json" && ! -e "${RN}/data/.vscode" ]] && echo yes)"
+unset AGENT_ROOT AGENT_DIR
+
+check "the worker protocol forbids a second submit" "1" \
+      "$(grep -c 'Submit exactly once' "${REPO}/skills/agent-fleet/references/worker-protocol.md")"
+
+group "release metadata agrees with VERSION"
+
+# One version, written once. Every other place that states it is checked here, so a bump that
+# misses CITATION.cff or a plugin manifest fails the suite instead of shipping a lie.
+VER="$(tr -d '[:space:]' < "${REPO}/VERSION")"
+check "fleet --version reports VERSION"      "agent-fleet ${VER}" "$("${FLEET}" --version)"
+check "CITATION.cff states VERSION"          "${VER}" \
+      "$(sed -n 's/^version: *//p' "${REPO}/CITATION.cff")"
+check "the plugin manifests state VERSION"   "2" \
+      "$(grep -c "\"version\": \"${VER}\"" "${REPO}/.claude-plugin/plugin.json" "${REPO}/.claude-plugin/marketplace.json" | grep -c ':1$')"
+check "pyproject reads its version from VERSION" "1" \
+      "$(grep -c -E '^dynamic = \["version"\]' "${REPO}/pyproject.toml")"
 
 group "documentation matches reality"
 

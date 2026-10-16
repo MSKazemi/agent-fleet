@@ -1,0 +1,10 @@
+{
+  "name": "agent-fleet",
+  "version": "0.2.0",
+  "description": "Run many Claude Code sessions in parallel against one shared task queue, sized to the work and the machine.",
+  "author": { "name": "Mohsen Seyedkazemi Ardebili", "url": "https://mskazemi.github.io" },
+  "homepage": "https://mskazemi.com/agent-fleet/",
+  "repository": "https://github.com/MSKazemi/agent-fleet",
+  "license": "Apache-2.0",
+  "keywords": ["parallel", "agents", "task-queue", "orchestration"]
+}

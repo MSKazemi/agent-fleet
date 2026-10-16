@@ -35,6 +35,14 @@ ancestor holding `.agents/`, else the git root, else `$PWD`. Every project keeps
 an independent queue, and several fleets can run at once without seeing each
 other's work.
 
+Two optional variables cover a project that keeps its queue somewhere unusual.
+`$AGENT_DIR` renames the queue directory (default `.agents`); it is read by both
+halves of `fleet` and forwarded to every worker, and the ignore rule then hides
+that one path instead of every directory of the same name. `$FLEET_WORKSPACE`
+names the folder VS Code actually has open (default: the queue's root) — set it
+when the queue sits in a subfolder of that repo, or `.vscode/tasks.json` is
+written where VS Code never reads it.
+
 ## Queue work
 
 ```bash
@@ -89,7 +97,8 @@ Inferred at `add` time — a live URL, or a kind listed in `browser_kinds`, mean
 fleet plan            # the schedule: lanes, terminals, and why it is capped
 fleet run             # start the browser lane
 fleet run 6           # override the count
-fleet run --headless  # detached workers logging to .agents/logs (no X11 needed)
+fleet run --windows   # one standalone terminal window per worker (works on Wayland)
+fleet run --headless  # detached workers logging to .agents/logs (no Chrome in them)
 fleet run --dry       # show or write what would start, start nothing
 ```
 
@@ -97,9 +106,12 @@ Terminals = `min(browser tasks, max_workers, distinct sites)`. The site term is
 deliberate: several workers against one host is a rate-limit ban, not more speed.
 Tune `max_workers` in `.agents/config.json` or pass `--max`.
 
-`fleet run` uses VS Code terminals when X11 and `xdotool` are available, and falls
-back to detached processes otherwise, announcing which it chose. `--terminals` and
-`--headless` force either.
+`fleet run` uses VS Code terminals when X11 and `xdotool` are available, opens one
+standalone terminal window per worker when they are not (Wayland), and runs detached
+only when there is no display — announcing which it chose. Visible workers start as
+`claude --chrome`. `--vscode`, `--windows` and `--headless` force a mode. `--ask` makes the workers
+interactive (they wait for you in their own window at a wall); the default is to park and
+move on. A human answer goes in with `fleet unblock ID --answer "..."`.
 
 **When `plan` says 0 terminals, open none.** `fleet run` refuses and points at the
 in-session path — the fast route, not a fallback:
@@ -159,7 +171,7 @@ by VS Code tasks or as detached processes.
 
 ## Requirements
 
-`python3` for everything; X11 + `xdotool` only for the terminal path (focus is
-taken briefly), `notify-send` for blocked alerts. `fleet doctor` and `bin/selftest`
-(85 checks, no browser needed) report what is missing instead of failing
+`python3` for everything; X11 + `xdotool` only for the VS Code terminal path (focus is
+taken briefly; `--windows` needs a terminal emulator instead), `notify-send` for blocked alerts. `fleet doctor` and `bin/selftest`
+(111 checks, no browser needed) report what is missing instead of failing
 obscurely — run the self-test after changing the tool.

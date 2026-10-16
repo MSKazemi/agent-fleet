@@ -1,0 +1,14 @@
+{
+  "name": "agent-fleet",
+  "description": "agent-fleet: run many Claude Code sessions in parallel against one shared task queue.",
+  "owner": { "name": "Mohsen Seyedkazemi Ardebili", "url": "https://mskazemi.github.io" },
+  "plugins": [
+    {
+      "name": "agent-fleet",
+      "source": "./",
+      "description": "The agent-fleet skill: queue work, size the parallelism, run workers, park what needs a human. Requires the `fleet` CLI (pipx install agent-fleet).",
+      "version": "0.2.0",
+      "homepage": "https://mskazemi.com/agent-fleet/"
+    }
+  ]
+}
