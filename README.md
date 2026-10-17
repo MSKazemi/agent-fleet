@@ -473,3 +473,9 @@ conditions worth knowing, and both are why this license rather than MIT:
   asks only for the copyright line.
 - **Patents are granted explicitly** (§3), which is what makes legal review at
   companies straightforward — wider adoption, more visibility.
+
+<!-- legal-notice: start -->
+### Legal notice and responsible use
+
+The materials in this repository are made available without warranties to the extent permitted by applicable law. **Please read the [Disclaimer and Responsible-Use Notice](DISCLAIMER.md)** before relying on or deploying them. This notice does not change any existing software license or limit rights that cannot legally be waived.
+<!-- legal-notice: end -->
